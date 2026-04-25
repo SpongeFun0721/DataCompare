@@ -8,6 +8,9 @@ wheels/
 uploads/
 output/
 data/
+backend/data
+backend/uploads
 
 # Virtual environments
 .venv
+.pdf_cache

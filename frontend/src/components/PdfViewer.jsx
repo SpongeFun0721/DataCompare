@@ -24,10 +24,12 @@ style.textContent = `
     padding: 1px 3px;
     border-radius: 2px;
   }
+
 `;
 document.head.appendChild(style);
 
-export default function PdfViewer({ pdfUrl, targetPage, highlightText, triggerKey, onTextSelect }) {
+
+export default function PdfViewer({ pdfUrl, targetPage, highlightText, triggerKey, onTextSelect, onPageChange, onNumPagesChange }) {
   const [numPages, setNumPages] = useState(null);
   const [currentPage, setCurrentPage] = useState(targetPage || 1);
   const [scale, setScale] = useState(1.0);
@@ -36,6 +38,8 @@ export default function PdfViewer({ pdfUrl, targetPage, highlightText, triggerKe
   const [selection, setSelection] = useState(null);
   const [extractedText, setExtractedText] = useState('');
   const [showTextPanel, setShowTextPanel] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+
 
   const extractPageText = useCallback(async (pageNum) => {
     if (!pdfDocRef.current) return;
@@ -64,16 +68,40 @@ export default function PdfViewer({ pdfUrl, targetPage, highlightText, triggerKe
     }
   }, []);
 
-  // triggerKey 变化时同步（响应代码跳转）
+    // triggerKey 变化时同步（响应代码跳转）
   useEffect(() => {
     if (targetPage && targetPage !== currentPage) {
       setCurrentPage(targetPage);
     }
-    // 页面切换时重新提取文本
+  }, [triggerKey]);
+
+  // highlightText 变化时重新提取文本（更新右侧文本面板）
+  useEffect(() => {
     if (currentPage) {
         extractPageText(currentPage);
     }
-  }, [triggerKey, extractPageText]);
+  }, [highlightText, currentPage, extractPageText]);
+
+  // 当外部 targetPage 变化时同步（快捷键 PgUp/PgDn）
+  useEffect(() => {
+    if (targetPage && targetPage !== currentPage) {
+      setCurrentPage(targetPage);
+    }
+  }, [targetPage]);
+
+  // 通知父组件 numPages
+  useEffect(() => {
+    if (numPages && onNumPagesChange) {
+      onNumPagesChange(numPages);
+    }
+  }, [numPages, onNumPagesChange]);
+
+  // 通知父组件页面变化
+  useEffect(() => {
+    if (onPageChange) {
+      onPageChange(currentPage);
+    }
+  }, [currentPage, onPageChange]);
 
   function onDocumentLoadSuccess(pdf) {
     pdfDocRef.current = pdf;
@@ -81,7 +109,8 @@ export default function PdfViewer({ pdfUrl, targetPage, highlightText, triggerKe
     extractPageText(currentPage);
   }
 
-  // 渲染文本层后的自定义高亮逻辑
+  // 渲染文本层后的自定义高亮逻辑（单 span 匹配）
+  // 使用正则匹配，支持单位后缀（如 highlightText="17人" 时匹配 "17"、"17人"、"17例" 等）
   const customTextRenderer = useCallback(({ str, itemIndex }) => {
     const spacelessStr = str.replace(/[\s\u3000]/g, '');
     if (!highlightText) return spacelessStr;
@@ -89,14 +118,176 @@ export default function PdfViewer({ pdfUrl, targetPage, highlightText, triggerKe
     const highlightStr = String(highlightText).replace(/[\s\u3000]/g, '');
     if (!highlightStr) return spacelessStr;
 
-    if (spacelessStr.includes(highlightStr)) {
-      return spacelessStr.replace(
-        new RegExp(highlightStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
-        match => `<mark class="pdf-highlight-mark">${match}</mark>`
-      );
+    // 提取高亮文本中的数值部分（如 "17人" → "17"）
+    const numMatch = highlightStr.match(/[\d,]+\.?\d*/);
+    if (!numMatch) {
+      // 没有数值，退回到精确包含匹配
+      if (spacelessStr.includes(highlightStr)) {
+        return spacelessStr.replace(
+          new RegExp(highlightStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
+          match => `<mark class="pdf-highlight-mark">${match}</mark>`
+        );
+      }
+      return spacelessStr;
     }
-    return spacelessStr;
+
+    const num = numMatch[0].replace(/,/g, '');
+    // 正则：匹配该数值，允许后面跟任意非数字字符（单位后缀）
+    // 使用负向前瞻避免匹配到更大数值的一部分（如 "17" 不匹配 "170"）
+    const regex = new RegExp(
+      `(?<![0-9.,])${num.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^0-9.,]*`,
+      'g'
+    );
+
+    return spacelessStr.replace(regex, match => {
+      // 只高亮数值部分，单位部分不高亮
+      const valMatch = match.match(/[\d,]+\.?\d*/);
+      if (valMatch && valMatch[0] === num) {
+        return `<mark class="pdf-highlight-mark">${match}</mark>`;
+      }
+      return match;
+    });
   }, [highlightText]);
+
+
+  // ============================================================
+  // 跨 span 文本高亮：通过 DOM 操作实现
+  // 解决 PDF 文本层将关键词拆分到多个相邻 span 中无法匹配的问题
+  // 使用 MutationObserver 监听文本层 DOM 变化，确保渲染完成后执行
+  // 匹配成功后，分别高亮每个 span（仅背景色，不加边框避免视觉断裂）
+  // ============================================================
+  useEffect(() => {
+    // 1. 先清除之前的高亮
+    document.querySelectorAll('.react-pdf__Page__textContent span[role="presentation"]').forEach(el => {
+      el.style.backgroundColor = '';
+      el.style.fontWeight = '';
+    });
+
+    if (!highlightText) return;
+
+    const target = String(highlightText).replace(/[\s\u3000]/g, '');
+    if (!target) return;
+
+    const HIGHLIGHT_STYLE = {
+      backgroundColor: 'rgba(255, 255, 0, 0.4)',
+      fontWeight: 'bold',
+    };
+
+    // 提取高亮文本中的数值部分（如 "17人" → "17"），用于正则匹配
+    const numMatch = target.match(/[\d,]+\.?\d*/);
+    const matchNum = numMatch ? numMatch[0].replace(/,/g, '') : null;
+
+    const doHighlight = () => {
+      const textContent = document.querySelector('.react-pdf__Page__textContent');
+      if (!textContent) return false;
+
+      const spans = Array.from(textContent.querySelectorAll('span[role="presentation"]'));
+      if (spans.length === 0) return false;
+
+      const getSpanText = (span) => span.textContent.replace(/[\s\u3000]/g, '');
+
+      // 辅助函数：检查文本是否匹配高亮目标（支持单位后缀）
+      const isMatch = (text) => {
+        if (text.includes(target)) return true;
+        // 如果高亮文本包含数值，尝试只匹配数值部分（允许单位后缀）
+        if (matchNum) {
+          const regex = new RegExp(
+            `(?<![0-9.,])${matchNum.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^0-9.,]*`
+          );
+          return regex.test(text);
+        }
+        return false;
+      };
+
+      // 2. 先尝试在单个 span 中匹配
+      for (const span of spans) {
+        if (isMatch(getSpanText(span))) {
+          Object.assign(span.style, HIGHLIGHT_STYLE);
+          console.log(`✅ 单 span 高亮: "${target}"`);
+          return true;
+        }
+      }
+
+      // 3. 单个 span 匹配失败，尝试合并相邻 span
+      for (let i = 0; i < spans.length; i++) {
+        let mergedText = getSpanText(spans[i]);
+        if (!mergedText) continue;
+
+        for (let j = i + 1; j < spans.length; j++) {
+          mergedText += getSpanText(spans[j]);
+
+          if (isMatch(mergedText)) {
+            // 匹配成功，分别高亮每个 span（仅背景色，无边框）
+            for (let k = i; k <= j; k++) {
+              Object.assign(spans[k].style, HIGHLIGHT_STYLE);
+            }
+            console.log(`✅ 跨 ${j - i + 1} 个 span 高亮: "${target}" (span[${i}]~span[${j}])`);
+            return true;
+          }
+
+          if (mergedText.length > target.length + 30) {
+            break;
+          }
+        }
+      }
+
+      return false;
+    };
+
+    // 立即尝试
+    if (doHighlight()) return;
+
+    // 使用 MutationObserver 监听文本层 DOM 变化
+    const textContent = document.querySelector('.react-pdf__Page__textContent');
+    if (textContent) {
+      const observer = new MutationObserver(() => {
+        if (doHighlight()) {
+          observer.disconnect();
+        }
+      });
+      observer.observe(textContent, { childList: true, subtree: true, characterData: true });
+      // 5 秒超时断开
+      const timeout = setTimeout(() => observer.disconnect(), 5000);
+      return () => {
+        observer.disconnect();
+        clearTimeout(timeout);
+      };
+    }
+
+    // 文本层还不存在，监听 body 变化
+    const bodyObserver = new MutationObserver(() => {
+      const tc = document.querySelector('.react-pdf__Page__textContent');
+      if (tc) {
+        if (doHighlight()) {
+          bodyObserver.disconnect();
+          return;
+        }
+        // 文本层存在但 span 为空，监听文本层
+        const observer = new MutationObserver(() => {
+          if (doHighlight()) {
+            observer.disconnect();
+          }
+        });
+        observer.observe(tc, { childList: true, subtree: true, characterData: true });
+        setTimeout(() => observer.disconnect(), 5000);
+        bodyObserver.disconnect();
+      }
+    });
+    bodyObserver.observe(document.body, { childList: true, subtree: true });
+    const timeout = setTimeout(() => bodyObserver.disconnect(), 5000);
+    return () => {
+      bodyObserver.disconnect();
+      clearTimeout(timeout);
+    };
+  }, [highlightText, currentPage]);
+
+
+
+
+
+
+
+
   // 监听鼠标抬起，获取选中的文本
   const handleMouseUp = () => {
     const activeSelection = window.getSelection();
@@ -254,12 +445,15 @@ export default function PdfViewer({ pdfUrl, targetPage, highlightText, triggerKe
             className="shadow-2xl"
           >
             <Page
+              key={`${currentPage}_${highlightText}`}
               pageNumber={currentPage || 1}
               scale={scale}
               customTextRenderer={customTextRenderer}
               loading={<div className="h-[800px] w-[600px] bg-slate-800 animate-pulse rounded" />}
               className="bg-white"
             />
+
+
           </Document>
         )}
 

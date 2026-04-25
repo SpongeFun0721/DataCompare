@@ -58,11 +58,15 @@ export async function uploadFiles(excelFile, pdfFiles) {
 /**
  * 触发分析
  * @param {string[]} selectedColors - 要分析的颜色列表
+ * @param {Object} colorMapping - 颜色到来源类型的映射，如 {"#XXXXXX": "yearbook", "#YYYYYY": "report"}
  */
-export async function runAnalysis(selectedColors = null) {
+export async function runAnalysis(selectedColors = null, colorMapping = {}) {
   return request('/analyze', {
     method: 'POST',
-    body: JSON.stringify({ selected_colors: selectedColors }),
+    body: JSON.stringify({ 
+      selected_colors: selectedColors,
+      color_mapping: colorMapping,
+    }),
   });
 }
 

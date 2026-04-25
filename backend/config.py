@@ -14,18 +14,21 @@ from pathlib import Path
 # 项目根目录
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# 数据输入目录（存放 Excel 和 PDF）
-DATA_DIR = BASE_DIR / "data"
-
+# 数据输入目录（存放 Excel 和 PDF）— 实际在 backend/data/
+DATA_DIR = Path(__file__).resolve().parent / "data"
 # 报告输出目录
 OUTPUT_DIR = BASE_DIR / "output"
 
 # 上传文件缓存目录
 UPLOAD_DIR = BASE_DIR / "uploads"
 
+# PDF 预处理缓存目录（持久化提取的文本和数值，重启后不丢失）
+PDF_CACHE_DIR = BASE_DIR / ".pdf_cache"
+
 # 确保目录存在
-for d in [DATA_DIR, OUTPUT_DIR, UPLOAD_DIR]:
+for d in [DATA_DIR, OUTPUT_DIR, UPLOAD_DIR, PDF_CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
 
 # ============================================================
 # 数值提取配置
@@ -80,3 +83,4 @@ HIGH_CONFIDENCE_THRESHOLD: int = 80
 
 # 低置信度阈值
 LOW_CONFIDENCE_THRESHOLD: int = 0
+

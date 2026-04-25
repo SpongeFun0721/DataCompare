@@ -14,9 +14,12 @@ export default function MatchPanel({
   analyzing,
   onConfirm,
   onDispute,
+  onNotFound,
   onNext,
   onPrev,
-  onManualBind
+  onManualBind,
+  onPdfPageChange,
+  onPdfNumPagesChange,
 }) {
   const indicator = currentMatches?.indicator;
 
@@ -75,17 +78,34 @@ export default function MatchPanel({
   return (
     <div className="flex flex-col h-full relative">
       {/* 顶部状态条：显示匹配指标信息和操作按钮 */}
-      <PdfStatusBar
+            <PdfStatusBar
         indicator={indicator}
         matchInfo={currentPdfMatchInfo}
         onConfirm={onConfirm}
         onDispute={onDispute}
+        onNotFound={onNotFound}
         onPrev={onPrev}
         onNext={onNext}
       />
 
+      {/* 数值不一致警告 */}
+      {currentPdfMatchInfo && indicator && 
+       currentPdfMatchInfo.matched_value !== undefined &&
+       currentPdfMatchInfo.matched_value !== null &&
+       indicator.target_value !== undefined &&
+       indicator.target_value !== null &&
+       currentPdfMatchInfo.matched_value !== indicator.target_value && (
+        <div className="px-4 py-2 bg-amber-500/10 border-b border-amber-500/20 flex items-center gap-2">
+          <span className="text-amber-400 text-xs">⚠️</span>
+          <span className="text-amber-300 text-xs">
+            PDF中匹配的数值（{currentPdfMatchInfo.matched_value}）与Excel目标值（{indicator.target_value}）不一致，请人工核对
+          </span>
+        </div>
+      )}
+
       {/* PDF 选择器（如果有多个 PDF） */}
       {pdfNames && pdfNames.length > 1 && (
+
         <div className="px-4 py-2 bg-slate-800/50 border-b border-white/5 flex items-center gap-2">
           <span className="text-xs text-slate-500">查看报告:</span>
           <select
@@ -100,7 +120,7 @@ export default function MatchPanel({
         </div>
       )}
 
-      {/* PDF 阅读器区域 */}
+            {/* PDF 阅读器区域 */}
       <div className="flex-1 min-h-0">
         <PdfViewer
           pdfUrl={pdfUrl}
@@ -108,6 +128,8 @@ export default function MatchPanel({
           highlightText={highlightText}
           triggerKey={triggerKey}
           onTextSelect={onManualBind}
+          onPageChange={onPdfPageChange}
+          onNumPagesChange={onPdfNumPagesChange}
         />
       </div>
     </div>

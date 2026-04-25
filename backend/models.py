@@ -9,6 +9,15 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class SourcePage(BaseModel):
+    """从 source_file 中解析出的一个数据来源"""
+
+    source_type: str = Field(description="来源类型: yearbook | report | url")
+    core_name: str | None = Field(default=None, description="PDF 核心文件名（不含 _ocr/_trans 后缀和页码）")
+    page: int | None = Field(default=None, description="页码（从 1 开始）")
+    url: str | None = Field(default=None, description="URL 地址")
+
+
 class Indicator(BaseModel):
     """Excel 中的一条指标记录"""
 
@@ -17,7 +26,7 @@ class Indicator(BaseModel):
     target_value: float = Field(description="Excel 中的目标数值")
     unit: str | None = Field(default=None, description="单位，如'万元'、'元'、'%'")
     aliases: list[str] = Field(default_factory=list, description="指标别名列表")
-    review_status: str = Field(default="未核对", description="核对状态：未核对|已确认|存疑|未找到")
+    review_status: str = Field(default="未核对", description="核对状态：未核对|已确认|存疑")
     note: str = Field(default="", description="备注")
     year: str = Field(default="", description="对应年份，如'2024年'")
     category1: str = Field(default="", description="一级分类")
@@ -25,7 +34,14 @@ class Indicator(BaseModel):
     row_index: int | None = Field(default=None, description="原始Excel中的行号(1-based)")
     col_name: str | None = Field(default=None, description="原始Excel中目标数值所在的列名")
     bg_color: str | None = Field(default=None, description="单元格背景颜色(十六进制，无填充为'无填充')")
-    source_file: str | None = Field(default=None, description="原数据来源(AI检索数据来源)")
+    source_file: str | None = Field(default=None, description="原数据来源(AI检索数据来源，原始值)")
+    source_file_yearbook: str | None = Field(default=None, description="年鉴来源文本（从 source_file 按颜色映射拆分）")
+    source_file_report: str | None = Field(default=None, description="司局报告来源文本（从 source_file 按颜色映射拆分）")
+    source_file_url: str | None = Field(default=None, description="URL 来源文本（从 source_file 按颜色映射拆分）")
+    source_pages: list[SourcePage] = Field(default_factory=list, description="从 source_file 解析出的来源列表")
+    matched_source_type: str | None = Field(default=None, description="实际匹配到的来源类型: yearbook | report | url")
+    matched_pdf_name: str | None = Field(default=None, description="实际匹配到的 PDF 文件名")
+    matched_page: int | None = Field(default=None, description="实际匹配到的页码")
 
 
 class NumberMatch(BaseModel):
@@ -77,7 +93,6 @@ class ProgressInfo(BaseModel):
     total: int = Field(description="指标总数")
     confirmed: int = Field(default=0, description="已确认数")
     disputed: int = Field(default=0, description="存疑数")
-    not_found: int = Field(default=0, description="未找到数")
     unchecked: int = Field(default=0, description="未核对数")
 
 
@@ -94,12 +109,13 @@ class AnalyzeRequest(BaseModel):
     """触发分析请求参数"""
     
     selected_colors: list[str] | None = Field(default=None, description="选中的背景色列表。如果为空则不限颜色。")
+    color_mapping: dict[str, str] | None = Field(default=None, description="颜色到来源类型的映射，如 {'#XXXXXX': 'yearbook', '#YYYYYY': 'report', '#ZZZZZZ': 'url'}")
 
 
 class StatusUpdate(BaseModel):
     """核对状态更新请求"""
 
-    status: str = Field(description="新状态：已确认|存疑")
+    status: str = Field(description="新状态：已确认|存疑|未核对")
     note: str = Field(default="", description="备注")
 
 

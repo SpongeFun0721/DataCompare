@@ -10,12 +10,16 @@ FastAPI 应用入口
 """
 
 from __future__ import annotations
-# pyright: reportMissingImports=false
 
+import asyncio
+import json
 import logging
+import re
 import shutil
+import uuid
 from pathlib import Path
 
+import fitz
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -44,6 +48,90 @@ app.add_middleware(
 )
 
 # ============================================================
+# 1. 启动时加载所有预存 PDF 的索引
+# ============================================================
+SHARED_PDF_DIR = DATA_DIR / "shared_pdfs"
+pdf_index: dict[str, str] = {}
+yearbook_index: dict[str, str] = {}
+map_data: dict[str, list[str]] = {}
+
+
+def build_pdf_index():
+    """遍历 data/shared_pdfs/ 目录，构建 PDF 索引。"""
+    global pdf_index, yearbook_index, map_data
+
+    pdf_dir = SHARED_PDF_DIR
+    if not pdf_dir.exists():
+        logger.warning(f"共享 PDF 目录不存在: {pdf_dir}")
+        return
+
+    # --- 索引所有 PDF 文件 ---
+    for f in pdf_dir.iterdir():
+        if not f.is_file():
+            continue
+        name = f.name
+
+        # 年鉴 PDF 单独处理，不加入 pdf_index
+        if "年鉴" in name:
+            continue
+
+        # 去掉 _ocr.pdf 或 _trans.pdf 后缀（支持文件名中数字与下划线之间有空格的情况）
+        core_name = re.sub(r'\s*_(ocr|trans)\.pdf$', '', name)
+        if core_name != name:
+            # 带 _ocr/_trans 后缀的司局报告
+            pdf_index[core_name] = name
+            logger.debug(f"索引司局 PDF: {core_name} -> {name}")
+        else:
+            # 不带 _ocr/_trans 后缀的普通 PDF 也加入索引（以去掉 .pdf 后的基名为 key）
+            base_name = name[:-4] if name.endswith(".pdf") else name
+            pdf_index[base_name] = name
+            logger.debug(f"索引普通 PDF: {base_name} -> {name}")
+
+    # --- 使用 glob 匹配年鉴 PDF（支持 年鉴2022.pdf、年鉴2023.pdf、中国体育年鉴.pdf 等变体）---
+    yearbook_files = sorted(pdf_dir.glob("*年鉴*.pdf"))
+    yearbook_index.clear()
+    if yearbook_files:
+        for yb_path in yearbook_files:
+            yb_name = yb_path.name
+            # 从文件名中提取年份
+            year_match = re.search(r'(\d{4})', yb_name)
+            if year_match:
+                year_str = year_match.group(1)
+                yearbook_index[year_str] = yb_name
+                logger.info(f"年鉴 PDF 索引: 年份 {year_str} -> {yb_name}")
+            else:
+                # 无年份的作为默认年鉴
+                yearbook_index["default"] = yb_name
+                logger.info(f"年鉴 PDF 索引(默认): {yb_name}")
+
+        logger.info(f"找到 {len(yearbook_files)} 个年鉴 PDF: {list(yearbook_index.keys())}")
+    else:
+        logger.warning("未找到年鉴 PDF (glob: *年鉴*.pdf)")
+
+    # --- 加载 map.json ---
+    map_path = DATA_DIR / "map.json"
+    if map_path.exists():
+        with open(map_path, "r", encoding="utf-8") as f:
+            map_data = json.load(f)
+        logger.info(f"加载 map.json，包含年份: {list(map_data.keys())}")
+    else:
+        logger.warning(f"map.json 不存在: {map_path}")
+
+    logger.info(f"PDF 索引加载完成: {len(pdf_index)} 个司局/普通 PDF + {len(yearbook_index)} 个年鉴 PDF")
+
+
+
+
+# 应用启动时构建索引
+build_pdf_index()
+
+# ============================================================
+# 2. 并发控制 & 任务状态
+# ============================================================
+_semaphore = asyncio.Semaphore(3)
+task_status: dict[str, str] = {}  # task_id -> status
+
+# ============================================================
 # 全局状态（单用户简化版，生产环境应使用数据库）
 # ============================================================
 _state: dict = {
@@ -57,67 +145,159 @@ _state: dict = {
 @app.post("/api/upload")
 async def upload_files(
     excel: UploadFile = File(...),
-    pdfs: list[UploadFile] = File(...),
+    user_id: str = "default",
 ):
     """
-    上传 Excel 和 PDF 文件。
+    上传 Excel 文件（去掉了 PDF 上传参数）。
 
-    - excel: 指标数据 Excel 文件
-    - pdfs: 一个或多个 PDF 年度报告文件
+    用户上传 Excel 后，系统自动进行 PDF 匹配并进入分析流程。
+    使用 user_id + task_id 创建独立工作目录。
     """
-    # 清空上传目录
-    upload_dir = UPLOAD_DIR
-    if upload_dir.exists():
-        shutil.rmtree(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    task_id = str(uuid.uuid4())
+    task_status[task_id] = "uploading"
 
-    pdf_dir = upload_dir / "pdfs"
-    pdf_dir.mkdir(exist_ok=True)
+    # 用户隔离：创建独立目录 uploads/{user_id}/{task_id}/
+    work_dir = UPLOAD_DIR / user_id / task_id
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     # 保存 Excel
-    excel_path = upload_dir / excel.filename
+    excel_path = work_dir / excel.filename
     with open(excel_path, "wb") as f:
         content = await excel.read()
         f.write(content)
 
-    # 保存 PDF
-    pdf_names = []
-    for pdf in pdfs:
-        pdf_path = pdf_dir / pdf.filename
-        with open(pdf_path, "wb") as f:
-            content = await pdf.read()
-            f.write(content)
-        pdf_names.append(pdf.filename)
-
     _state["excel_path"] = excel_path
-    _state["pdf_dir"] = pdf_dir
     _state["analysis"] = None
     _state["comparator"] = None
 
-    # 解析 Excel 以获取颜色选项
+    # 解析 Excel
     try:
         indicators = read_indicators(excel_path)
         _state["indicators"] = indicators
-        
-        # 提取去重的颜色列表
+
         unique_colors = list(set([ind.bg_color for ind in indicators if ind.bg_color]))
-        # 保证 "无填充" 在前面
         if "无填充" in unique_colors:
             unique_colors.remove("无填充")
             unique_colors.insert(0, "无填充")
-            
+
     except Exception as e:
         logger.exception("解析 Excel 失败")
+        task_status[task_id] = "error"
         raise HTTPException(400, f"读取 Excel 失败: {e}")
 
-    logger.info(f"文件上传并解析完成: Excel={excel.filename}, PDFs={pdf_names}, 颜色={unique_colors}")
+    # ============================================================
+    # 3. 收集所有可能需要的 PDF 文件（用于预处理）
+    #    使用 Comparator._parse_source_file 解析每个指标的 source_file，
+    #    收集所有引用的 PDF 核心文件名，在 shared_pdfs 中查找匹配的实际文件。
+    # ============================================================
+    from backend.comparator import Comparator
+
+    matched_pdfs: set[str] = set()
+    url_count = 0
+
+    for ind in indicators:
+        source_pages = Comparator._parse_source_file(ind.source_file)
+        for sp in source_pages:
+            if sp.source_type == "url":
+                url_count += 1
+                continue
+            if sp.source_type == "yearbook":
+                # 年鉴：将所有年鉴 PDF 都加入 matched_pdfs，确保预处理阶段全部加载
+                for yb_name in yearbook_index.values():
+                    matched_pdfs.add(yb_name)
+            else:
+                # 司局报告：使用原有的匹配逻辑
+                pdf_names = [p.name for p in SHARED_PDF_DIR.glob("*.pdf")]
+                actual_name = Comparator._match_pdf_name(sp.core_name, pdf_names)
+                if actual_name:
+                    matched_pdfs.add(actual_name)
+
+    task_status[task_id] = "uploaded"
+
+    logger.info(
+        f"上传并解析完成: Excel={excel.filename}, "
+        f"共 {len(indicators)} 个指标, "
+        f"收集到 {len(matched_pdfs)} 个 PDF, "
+        f"{url_count} 个 URL 来源, "
+        f"颜色={unique_colors}"
+    )
+
+    _state["task_id"] = task_id
+    _state["matched_pdfs"] = list(matched_pdfs)
 
     return {
         "message": "上传并解析成功",
+        "task_id": task_id,
         "excel": excel.filename,
-        "pdfs": pdf_names,
+        "matched_pdfs": list(matched_pdfs),
+        "url_count": url_count,
         "colors": unique_colors,
+        "indicators_count": len(indicators),
     }
+
+
+
+def _infer_data_type(source_file: str) -> str:
+    """从 source_file 字符串推断数据类型。"""
+    if not source_file:
+        return "document"
+    if re.match(r'^https?://', source_file.strip()):
+        return "url"
+    if "年鉴" in source_file:
+        return "yearbook"
+    return "document"
+
+
+def _extract_pdf_name(source_file: str) -> str | None:
+    """
+    从 source_file 中提取 PDF 文件名（核心文件名）。
+
+    source_file 示例：
+    "33.反兴奋剂中心关于2022年工作总结和2023年工作计划的报告+P6;\\n中国体育年鉴+P363;\\nhttps://..."
+
+    提取逻辑：
+    1. 按分号或换行分割
+    2. 排除包含 URL 或"年鉴"的部分
+    3. 取第一个符合条件的部分
+    4. 去掉 +P页码 后缀
+    """
+    parts = re.split(r'[;\\n]+', source_file)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if re.match(r'^https?://', part):
+            continue
+        if "年鉴" in part:
+            continue
+        clean = re.sub(r'\s*\+P\d+.*$', '', part).strip()
+        if clean:
+            return clean
+    return None
+
+
+def _find_in_year_group(pdf_core_name: str, year_group: list[str]) -> str | None:
+    """
+    在年份组中查找匹配的核心文件名。
+
+    支持模糊匹配：
+    1. 精确匹配
+    2. 包含匹配
+    3. 前缀匹配
+    """
+    if pdf_core_name in year_group:
+        return pdf_core_name
+
+    for entry in year_group:
+        if pdf_core_name in entry or entry in pdf_core_name:
+            return entry
+
+    short_name = pdf_core_name[:10]
+    for entry in year_group:
+        if entry.startswith(short_name) or short_name in entry:
+            return entry
+
+    return None
 
 
 @app.post("/api/analyze", response_model=AnalysisResponse)
@@ -130,34 +310,77 @@ async def run_analysis(req: AnalyzeRequest):
         raise HTTPException(400, "请先上传文件")
 
     if pdf_dir is None:
-        pdf_dir = DATA_DIR
-        if not list(DATA_DIR.glob("*.pdf")):
-            raise HTTPException(400, "请先上传文件或在 data/ 目录中放置 PDF 文件")
+        pdf_dir = SHARED_PDF_DIR
+        if not pdf_dir.exists() or not list(pdf_dir.glob("*.pdf")):
+            raise HTTPException(400, "请先上传文件或在 data/shared_pdfs/ 目录中放置 PDF 文件")
 
-    # 根据选择的颜色过滤指标
     filtered_indicators = indicators
     if req.selected_colors is not None:
         filtered_indicators = [
-            ind for ind in indicators 
+            ind for ind in indicators
             if ind.bg_color in req.selected_colors
         ]
-        
+
     if not filtered_indicators:
         raise HTTPException(400, "未找到符合所选颜色的指标数据")
 
-    comparator = Comparator()
-    _state["comparator"] = comparator
+    # 应用颜色→来源类型映射，将 source_file 分配到三个互斥字段
+    color_mapping = req.color_mapping or {}
+    for ind in filtered_indicators:
+        # 根据 bg_color 确定来源类型
+        source_type = color_mapping.get(ind.bg_color, "")
+        if source_type == "yearbook":
+            ind.source_file_yearbook = ind.source_file
+        elif source_type == "report":
+            ind.source_file_report = ind.source_file
+        elif source_type == "url":
+            ind.source_file_url = ind.source_file
+        # 如果映射为空或未知类型，则不设置任何字段（后续会被标记为存疑）
 
-    try:
-        analysis = comparator.run_full_analysis(filtered_indicators, pdf_dir)
-    except Exception as e:
-        logger.exception("分析失败")
-        raise HTTPException(500, f"分析失败: {e}")
+    # 获取上传时匹配到的 PDF 文件名列表，仅预处理这些需要的 PDF
+    matched_pdfs = _state.get("matched_pdfs", [])
+    print(f"\n=== /api/analyze ===")
+    print(f"  filtered_indicators: {len(filtered_indicators)} 个")
+    print(f"  matched_pdfs (from _state): {matched_pdfs}")
+    print(f"  pdf_dir: {pdf_dir}")
+    if pdf_dir:
+        print(f"  pdf_dir 中的文件: {[p.name for p in sorted(pdf_dir.glob('*.pdf'))]}")
+
+    if not matched_pdfs:
+        print(f"  ⚠️ matched_pdfs 为空，将回退到 run_full_analysis")
+    else:
+        print(f"  将仅预处理匹配到的 {len(matched_pdfs)} 个 PDF: {matched_pdfs}")
+
+    async with _semaphore:
+        comparator = Comparator()
+        _state["comparator"] = comparator
+
+        try:
+            # 仅预处理匹配到的 PDF 文件
+            pdf_files = [pdf_dir / name for name in matched_pdfs if (pdf_dir / name).exists()]
+            print(f"  实际存在的 PDF 文件: {[p.name for p in pdf_files]}")
+            if not pdf_files:
+                print(f"  ⚠️ 所有 matched_pdfs 都不存在！回退到 run_full_analysis")
+                # 回退：预处理目录下所有 PDF
+                analysis = comparator.run_full_analysis(filtered_indicators, pdf_dir, yearbook_index)
+            else:
+                for pdf_path in pdf_files:
+                    print(f"  预处理: {pdf_path.name}")
+                    comparator.preprocess_pdf(pdf_path)
+                pdf_names = [p.name for p in pdf_files]
+                print(f"  预处理完成，pdf_names: {pdf_names}")
+                print(f"  缓存中的 key: {list(comparator._cache.keys())}")
+                analysis = comparator.run_analysis_on_preprocessed(filtered_indicators, pdf_names, yearbook_index)
+        except Exception as e:
+            logger.exception("分析失败")
+            raise HTTPException(500, f"分析失败: {e}")
+
 
     _state["analysis"] = analysis
     logger.info(f"分析完成: {len(filtered_indicators)} 个指标, {len(analysis.pdf_names)} 个 PDF")
 
     return analysis
+
 
 
 @app.get("/api/indicators")
@@ -198,8 +421,6 @@ async def update_indicator_status(indicator_id: int, body: StatusUpdate):
         if result.indicator.id == indicator_id:
             result.indicator.review_status = body.status
             result.indicator.note = body.note
-
-            # 重新计算进度
             analysis.progress = _calc_progress(analysis)
             logger.info(f"指标 [{result.indicator.name}] 状态更新为: {body.status}")
             return {"message": "更新成功", "progress": analysis.progress}
@@ -262,14 +483,11 @@ async def export_original():
         from backend.report_generator import generate_colored_original_excel
         report_filename = f"标色原表_{excel_path.name}"
         report_path = generate_colored_original_excel(
-            analysis.results, 
+            analysis.results,
             excel_path,
             output_path=OUTPUT_DIR / report_filename
         )
-        
-        # 对中文文件名进行 URL 编码
         encoded_filename = quote(report_path.name)
-        
         return FileResponse(
             path=str(report_path),
             filename=report_path.name,
@@ -304,7 +522,6 @@ async def export_text():
         output_path.write_text(text_content, encoding="utf-8")
 
         encoded_filename = quote(output_path.name)
-
         return FileResponse(
             path=str(output_path),
             filename=output_path.name,
@@ -321,24 +538,24 @@ async def export_text():
 @app.get("/api/pdf/{filename}")
 async def serve_pdf(filename: str):
     """提供 PDF 文件的 HTTP 访问，供前端 PDF 阅读器加载。"""
-    pdf_dir = _state.get("pdf_dir")
-    
-    # 因为开发环境下热重载会导致 _state 丢失，这里做个智能回退
-    if pdf_dir is None:
-        from backend.config import UPLOAD_DIR, DATA_DIR
-        if (UPLOAD_DIR / "pdfs" / filename).exists():
-            pdf_dir = UPLOAD_DIR / "pdfs"
-        else:
-            pdf_dir = DATA_DIR
-            
-    logger.info(f"serve_pdf requested filename: {filename}, current pdf_dir: {pdf_dir}")
-        
-    pdf_path = pdf_dir / filename
-    logger.info(f"Looking for PDF at: {pdf_path}")
+    # 优先从 SHARED_PDF_DIR 查找
+    pdf_path = SHARED_PDF_DIR / filename
     if not pdf_path.exists():
-        logger.error(f"PDF not found at {pdf_path}")
+        # 回退到 UPLOAD_DIR/pdfs
+        from backend.config import UPLOAD_DIR
+        pdf_path = UPLOAD_DIR / "pdfs" / filename
+    if not pdf_path.exists():
+        # 再回退到 _state 中的 pdf_dir
+        pdf_dir = _state.get("pdf_dir")
+        if pdf_dir:
+            pdf_path = pdf_dir / filename
+
+    logger.info(f"serve_pdf requested filename: {filename}")
+
+    if not pdf_path.exists():
+        logger.error(f"PDF not found: {filename}")
         raise HTTPException(404, "PDF 文件不存在")
-        
+
     return FileResponse(
         path=str(pdf_path),
         media_type="application/pdf",
@@ -347,6 +564,69 @@ async def serve_pdf(filename: str):
             "Content-Disposition": "inline"
         }
     )
+
+
+
+# ============================================================
+# 6. PDF 页面文本接口
+# ============================================================
+@app.get("/api/pdf/{pdf_name}/page/{page_num}")
+async def get_pdf_page_text(pdf_name: str, page_num: int):
+    """
+    返回 PDF 指定页码的文本内容。
+    使用 fitz.open 只读那一页，读完即关闭。
+    """
+    # 优先从 SHARED_PDF_DIR 查找
+    pdf_path = SHARED_PDF_DIR / pdf_name
+    if not pdf_path.exists():
+        # 回退到 DATA_DIR
+        pdf_path = DATA_DIR / pdf_name
+    if not pdf_path.exists():
+        # 再回退到 UPLOAD_DIR/pdfs
+        from backend.config import UPLOAD_DIR
+        pdf_path = UPLOAD_DIR / "pdfs" / pdf_name
+    if not pdf_path.exists():
+        raise HTTPException(404, f"PDF 文件不存在: {pdf_name}")
+
+
+    try:
+        doc = fitz.open(str(pdf_path))
+        if page_num < 0 or page_num >= len(doc):
+            total = len(doc)
+            doc.close()
+            raise HTTPException(404, f"页码 {page_num} 超出范围 (共 {total} 页)")
+
+        page = doc[page_num]
+        text = page.get_text("text")
+        total_pages = len(doc)
+        doc.close()
+
+        return {
+            "pdf_name": pdf_name,
+            "page_num": page_num,
+            "total_pages": total_pages,
+            "text": text,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"读取 PDF 页面失败: {pdf_name} 第{page_num}页")
+        raise HTTPException(500, f"读取 PDF 页面失败: {e}")
+
+
+# ============================================================
+# 5. 任务状态查询接口
+# ============================================================
+@app.get("/api/task/{task_id}/status")
+async def get_task_status(task_id: str):
+    """查询异步任务的状态。"""
+    status = task_status.get(task_id)
+    if status is None:
+        raise HTTPException(404, f"任务不存在: {task_id}")
+    return {
+        "task_id": task_id,
+        "status": status,
+    }
 
 
 @app.post("/api/manual_bind")
@@ -358,11 +638,9 @@ async def manual_bind(body: ManualBinding):
 
     for result in analysis.results:
         if result.indicator.id == body.indicator_id:
-            # 更新状态为已确认（手动）
             result.indicator.review_status = "已确认"
             result.indicator.note = f"手动绑定: {body.pdf_name} (第 {body.page} 页)"
-            
-            # 将手动选区记录到 matches 中以便展示
+
             from backend.models import MatchResult
             manual_match = MatchResult(
                 pdf_name=body.pdf_name,
@@ -373,15 +651,13 @@ async def manual_bind(body: ManualBinding):
                 context=body.selected_text,
                 context_highlighted=f"<mark>{body.selected_text}</mark>"
             )
-            
+
             if body.pdf_name not in result.matches:
                 result.matches[body.pdf_name] = []
-                
-            # 可以选择追加或替换当前的 best_matches
+
             result.best_matches[body.pdf_name] = manual_match
             result.matches[body.pdf_name].append(manual_match)
-            
-            # 重新计算进度
+
             analysis.progress = _calc_progress(analysis)
             logger.info(f"指标 [{result.indicator.name}] 手动绑定成功: {body.pdf_name} 页码 {body.page}")
             return {"message": "绑定成功", "progress": analysis.progress}
@@ -395,11 +671,9 @@ def _calc_progress(analysis: AnalysisResponse) -> ProgressInfo:
     total = len(indicators)
     confirmed = sum(1 for i in indicators if i.review_status == "已确认")
     disputed = sum(1 for i in indicators if i.review_status == "存疑")
-    not_found = sum(1 for i in indicators if i.review_status == "未找到")
     return ProgressInfo(
         total=total,
         confirmed=confirmed,
         disputed=disputed,
-        not_found=not_found,
-        unchecked=total - confirmed - disputed - not_found,
+        unchecked=total - confirmed - disputed,
     )

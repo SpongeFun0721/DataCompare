@@ -16,46 +16,6 @@ import {
   exportText as apiExportText,
   saveManualBinding as apiSaveManualBinding,
 } from '../api';
-import fileMap from '../data/map.json';
-
-const normalize = (str) => str.replace(/\s+/g, '');
-
-const findMatchInSource = (sourceFile, yearStr) => {
-  if (!sourceFile) return null;
-  
-  const yearMatch = yearStr?.match(/(\d{4})/);
-  const year = yearMatch ? yearMatch[1] : null;
-  
-  if (!year || !fileMap[year]) return null;
-
-  const sourceLines = sourceFile
-    .split(/[;\n]+/)
-    .map(s => s.trim())
-    .filter(s => s);
-
-  for (const line of sourceLines) {
-    if (!line.includes('+P')) continue;
-    
-    if (line.toLowerCase().includes('http') || line.toLowerCase().includes('www') || line.includes('年鉴')) continue;
-
-    const parts = line.split('+P');
-    const rawName = parts[0];
-    const pageMatch = parts[1].match(/(\d+)/);
-    const page = pageMatch ? parseInt(pageMatch[1], 10) : null;
-    
-    if (page === null) continue;
-
-    const normalizedRawName = normalize(rawName);
-
-    for (const coreName of fileMap[year]) {
-      const normalizedCoreName = normalize(coreName);
-      if (normalizedRawName.includes(normalizedCoreName) || normalizedCoreName.includes(normalizedRawName)) {
-        return { coreName, page, fullLine: line };
-      }
-    }
-  }
-  return null;
-};
 
 export function useCompareData() {
   const [triggerKey, setTriggerKey] = useState('');
@@ -70,7 +30,7 @@ export function useCompareData() {
   const [selectedPdf, setSelectedPdf] = useState(null);
   const [targetPage, setTargetPage] = useState(1);
   const [highlightText, setHighlightText] = useState('');
-  const [progress, setProgress] = useState({ total: 0, confirmed: 0, disputed: 0, not_found: 0, unchecked: 0 });
+  const [progress, setProgress] = useState({ total: 0, confirmed: 0, disputed: 0, unchecked: 0 });
 
   const [loading, setLoading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -80,6 +40,7 @@ export function useCompareData() {
 
   const [availableColors, setAvailableColors] = useState([]);
   const [selectedColors, setSelectedColors] = useState([]);
+  const [colorMapping, setColorMapping] = useState({}); // { "#XXXXXX": "yearbook" | "report" | "url" }
 
   // ---- 上传文件 ----
   const upload = useCallback(async (excelFile, pdfFiles) => {
@@ -101,6 +62,14 @@ export function useCompareData() {
       const colors = data.colors || [];
       setAvailableColors(colors);
       setSelectedColors(colors);
+      // 重置颜色映射，默认全部设为 AI
+      const defaultMapping = {};
+      for (const color of colors) {
+        if (color !== '无填充') {
+          defaultMapping[color] = 'url'; // 默认 AI
+        }
+      }
+      setColorMapping(defaultMapping);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -118,7 +87,7 @@ export function useCompareData() {
     setAnalyzing(true);
     setError(null);
     try {
-      const data = await apiAnalyze(selectedColors);
+      const data = await apiAnalyze(selectedColors, colorMapping);
       setIndicators(data.indicators);
       setPdfNames(data.pdf_names);
       setAllResults(data.results);
@@ -135,143 +104,92 @@ export function useCompareData() {
     } finally {
       setAnalyzing(false);
     }
-  }, [selectedColors]);
+  }, [selectedColors, colorMapping]);
 
 // ---- 选中指标时加载匹配数据 ----
+// 核心原则：
+// 1. PDF 名称和页码始终使用 indicator.matched_* 字段（来自 AI 数据来源行）
+// 2. 高亮文本优先使用 bestMatch 的匹配值，无匹配时使用 target_value
+// 3. 无论是否匹配到数值，都按来源行指定的页码打开 PDF
 const selectIndicator = useCallback((id) => {
     setSelectedId(id);
     const found = allResults.find(r => r.indicator.id === id);
     setCurrentMatches(found || null);
 
-    console.log('=== selectIndicator Debug ===');
+    console.log('=== selectIndicator Debug (v3 - 始终使用来源行页码) ===');
     console.log('selected id:', id);
-    console.log('source_file raw:', found?.indicator?.source_file);
-    console.log('pdfNames:', pdfNames);
     console.log('best_matches:', found?.best_matches);
+    console.log('indicator.matched_*:', {
+      matched_source_type: found?.indicator?.matched_source_type,
+      matched_pdf_name: found?.indicator?.matched_pdf_name,
+      matched_page: found?.indicator?.matched_page,
+    });
 
-    if (found) {
-      const sourceFile = found.indicator.source_file || '';
-      const year = found.indicator.year || '';
+    if (!found) return;
 
-      // 同时处理分号和换行符分隔
-      const sourceLines = sourceFile
-        .split(/[;\n]+/)
-        .map(s => s.trim())
-        .filter(s => s);
+    const bestMatches = found.best_matches || {};
+    const indicatorData = found.indicator || {};
 
-      console.log('source_lines:', sourceLines);
+    // 1. 从 best_matches 中找到最佳匹配（仅用于高亮文本）
+    let bestMatch = null;
+    let bestConfidence = -1;
 
-      let matchedPdfName = null;
-      let parsedPage = null;
-
-      // 1. 尝试使用映射表精确匹配
-      const match = findMatchInSource(sourceFile, year);
-
-      if (match) {
-        console.log('Exact match found:', match);
-        const ocrName = match.coreName + '_ocr.pdf';
-        const transName = match.coreName + '_trans.pdf';
-
-        if (pdfNames.includes(ocrName)) {
-          matchedPdfName = ocrName;
-        } else if (pdfNames.includes(transName)) {
-          matchedPdfName = transName;
-        } else {
-          matchedPdfName = ocrName; // 默认回退到ocr
-        }
-
-        parsedPage = match.page;
-      } else {
-        console.log('No exact match, falling back to old logic');
-
-        // 智能匹配：找到 best_matches 中实际有匹配值的那一行
-        let targetSourceLine = null;
-
-        // 策略1：从 best_matches 中找到真正有匹配的 PDF
-        const bestMatches = found.best_matches || {};
-        const matchedPdfs = Object.entries(bestMatches)
-          .filter(([, m]) => m && m.is_match)
-          .sort((a, b) => b[1].confidence - a[1].confidence);
-
-        console.log('matched pdfs:', matchedPdfs);
-
-        if (matchedPdfs.length > 0) {
-          // 使用置信度最高的匹配
-          const [bestPdfName, bestMatch] = matchedPdfs[0];
-          matchedPdfName = bestPdfName;
-          parsedPage = bestMatch.page_number;
-
-          // 在 sourceLines 中找到与这个 PDF 名称匹配的行
-          for (const line of sourceLines) {
-            const cleanLine = line.split('+P')[0].trim();
-            const cleanPdfName = bestPdfName.replace('_ocr.pdf', '');
-
-            if (cleanPdfName.includes(cleanLine) || cleanLine.includes(cleanPdfName)) {
-              targetSourceLine = line;
-              console.log('matched source line by pdf:', targetSourceLine);
-              break;
-            }
-          }
-
-          // 如果按名称没匹配到，尝试按年份匹配
-          if (!targetSourceLine) {
-            const yearMatch = bestPdfName.match(/(\d{4})/);
-            if (yearMatch) {
-              const y = yearMatch[1];
-              targetSourceLine = sourceLines.find(line => line.includes(y));
-              console.log('matched source line by year:', targetSourceLine);
-            }
-          }
-        }
-
-        // 回退策略：如果还没有匹配到，使用第一个 source line 和第一个 PDF
-        if (!targetSourceLine && sourceLines.length > 0) {
-          targetSourceLine = sourceLines[0];
-          console.log('fallback to first source line:', targetSourceLine);
-        }
-
-        if (!matchedPdfName && pdfNames.length > 0) {
-          matchedPdfName = pdfNames[0];
-          console.log('fallback to first pdf:', matchedPdfName);
-        }
-
-        // 从匹配的行中提取页码
-        if (parsedPage === null && targetSourceLine) {
-          const pageMatch = targetSourceLine.match(/\+P(\d+)/i);
-          parsedPage = pageMatch ? parseInt(pageMatch[1], 10) : null;
-          console.log('parsed page from source:', parsedPage);
-        }
-        
-        // 如果前面没解析出页码，使用最佳匹配的页码
-        if (parsedPage === null && matchedPdfs.length > 0) {
-          parsedPage = matchedPdfs[0][1].page_number;
-          console.log('using best match page:', parsedPage);
-        }
+    for (const [pdfName, match] of Object.entries(bestMatches)) {
+      if (!match) continue;
+      if (match.is_match && match.confidence > bestConfidence) {
+        bestMatch = { ...match, pdf_name: pdfName };
+        bestConfidence = match.confidence;
       }
-
-      // 设置选中的 PDF
-      setSelectedPdf(matchedPdfName);
-
-      // 设置页码和高亮文本
-      if (parsedPage !== null) {
-        setTargetPage(parsedPage);
-      }
-
-      // 检查是否有匹配的高亮文本
-      const currentPdfMatch = matchedPdfName && found.best_matches ? found.best_matches[matchedPdfName] : null;
-
-      if (currentPdfMatch && currentPdfMatch.is_match) {
-        setHighlightText(currentPdfMatch.matched_value_raw || '');
-        console.log('highlight from current pdf:', currentPdfMatch.matched_value_raw);
-      } else {
-        // 即使在当前 PDF 没找到，也先清空高亮，等 PDF 加载后再查找
-        setHighlightText('');
-        console.log('no match in current pdf, clearing highlight');
-      }
-      
-      setTriggerKey(`${id}_${parsedPage || 1}`);
     }
-  }, [allResults, pdfNames]);
+
+    if (!bestMatch) {
+      for (const [pdfName, match] of Object.entries(bestMatches)) {
+        if (!match) continue;
+        if (match.confidence > bestConfidence) {
+          bestMatch = { ...match, pdf_name: pdfName };
+          bestConfidence = match.confidence;
+        }
+      }
+    }
+
+    // 2. 获取来源行信息（始终可用）
+    const matchedPdfName = indicatorData.matched_pdf_name;
+    const matchedPage = indicatorData.matched_page;
+    const matchedSourceType = indicatorData.matched_source_type;
+
+    // 3. 设置 PDF 阅读器
+    if (matchedSourceType === 'url') {
+      // URL 来源 → 不打开 PDF
+      setSelectedPdf(null);
+      setTargetPage(1);
+      setHighlightText(String(indicatorData.target_value));
+      console.log('⏭️ URL 来源，不打开 PDF');
+    } else if (matchedPdfName) {
+      // 有来源行指定的 PDF → 始终按来源行页码打开
+      setSelectedPdf(matchedPdfName);
+      setTargetPage(matchedPage || 1);
+
+      // 高亮文本：有匹配用匹配值，无匹配用 target_value
+      if (bestMatch) {
+        const highlightVal = bestMatch.matched_value_raw
+          ?? String(bestMatch.matched_value)
+          ?? String(indicatorData.target_value);
+        setHighlightText(highlightVal);
+        console.log(`✅ 有匹配: pdf=${matchedPdfName}, page=${matchedPage}, highlight="${highlightVal}"`);
+      } else {
+        setHighlightText(String(indicatorData.target_value));
+        console.log(`⚠️ 无数值匹配: pdf=${matchedPdfName}, page=${matchedPage}, highlight=target_value="${indicatorData.target_value}"`);
+      }
+    } else {
+      // 完全没有任何来源信息
+      setSelectedPdf(null);
+      setTargetPage(1);
+      setHighlightText('');
+      console.log('❌ 无任何来源信息');
+    }
+
+    setTriggerKey(`${id}_${matchedPage || 1}`);
+  }, [allResults]);
 
   const selectNextIndicator = useCallback(() => {
     if (selectedId === null || selectedId === undefined || allResults.length === 0) return;
@@ -398,13 +316,13 @@ const selectIndicator = useCallback((id) => {
     progress,
     loading, analyzing, error,
     uploaded, analyzed,
-    availableColors, selectedColors,
+    availableColors, selectedColors, colorMapping,
     selectedPdf, targetPage, highlightText, triggerKey,
     // 方法
     upload, analyze,
     selectIndicator, selectNextIndicator, selectPrevIndicator, setReviewStatus, handleManualBind,
     setSelectedPdf, setTargetPage,
     doExport, doExportOriginal, doExportText,
-    setError, toggleColor,
+    setError, toggleColor, setColorMapping,
   };
 }

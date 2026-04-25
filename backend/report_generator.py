@@ -38,7 +38,6 @@ THIN_BORDER = Border(
 STATUS_MAP = {
     "已确认": ("🟢", PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")),
     "存疑": ("🟡", PatternFill(start_color="FFF8E1", end_color="FFF8E1", fill_type="solid")),
-    "未找到": ("🔴", PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")),
     "未核对": ("🔵", PatternFill(start_color="E3F2FD", end_color="E3F2FD", fill_type="solid")),
 }
 
@@ -120,7 +119,6 @@ def generate_colored_original_excel(
         "已确认": PatternFill(start_color="92D050", end_color="92D050", fill_type="solid"), # 绿色
         "未核对": PatternFill(start_color="9BC2E6", end_color="9BC2E6", fill_type="solid"), # 蓝色
         "存疑": PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid"),   # 黄色
-        "未找到": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # 浅红色
     }
 
     for result in results:

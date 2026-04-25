@@ -14,21 +14,28 @@ const STATUS_ICONS = {
   '未核对': { icon: '🔵', bg: 'bg-blue-500/10', text: 'text-blue-400' },
   '已确认': { icon: '🟢', bg: 'bg-emerald-500/10', text: 'text-emerald-400' },
   '存疑':   { icon: '🟡', bg: 'bg-amber-500/10', text: 'text-amber-400' },
-  '未找到': { icon: '🔴', bg: 'bg-red-500/10', text: 'text-red-400' },
 };
 
-export default function IndicatorTable({ indicators, selectedId, onSelect, allResults, pdfNames }) {
+export default function IndicatorTable({ indicators, selectedId, onSelect, allResults, pdfNames, yearFilter = '全部' }) {
   const [search, setSearch] = useState('');
 
-  const filtered = useMemo(() => {
-    if (!search.trim()) return indicators;
-    const q = search.trim().toLowerCase();
-    return indicators.filter(ind =>
-      ind.name.toLowerCase().includes(q) ||
-      String(ind.target_value).includes(q) ||
-      (ind.year && ind.year.includes(q))
-    );
-  }, [indicators, search]);
+    const filtered = useMemo(() => {
+    let list = indicators;
+    // 年份筛选
+    if (yearFilter && yearFilter !== '全部') {
+      list = list.filter(ind => ind.year === yearFilter);
+    }
+    // 搜索筛选
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter(ind =>
+        ind.name.toLowerCase().includes(q) ||
+        String(ind.target_value).includes(q) ||
+        (ind.year && ind.year.includes(q))
+      );
+    }
+    return list;
+  }, [indicators, search, yearFilter]);
 
   // 获取指标的匹配概况
   const getMatchSummary = (indicatorId) => {
@@ -49,8 +56,8 @@ export default function IndicatorTable({ indicators, selectedId, onSelect, allRe
 
   return (
     <div className="flex flex-col h-full">
-      {/* 搜索框 */}
-      <div className="p-3 border-b border-white/5">
+            {/* 搜索框 + 年份筛选 */}
+      <div className="p-3 border-b border-white/5 space-y-2">
         <div className="relative">
           <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -63,6 +70,18 @@ export default function IndicatorTable({ indicators, selectedId, onSelect, allRe
             className="w-full pl-9 pr-3 py-2 bg-white/5 border border-white/10 rounded-lg text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25 transition-all"
           />
         </div>
+        {/* 年份筛选提示 */}
+        {yearFilter && yearFilter !== '全部' && (
+          <div className="flex items-center gap-1.5 px-1">
+            <span className="text-[10px] text-slate-500">筛选:</span>
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400 border border-purple-500/20">
+              {yearFilter}年
+            </span>
+            <span className="text-[10px] text-slate-500 ml-auto">
+              快捷键: <kbd className="px-1 py-0.5 bg-slate-700 rounded text-slate-300 text-[9px]">1</kbd> 全部
+            </span>
+          </div>
+        )}
       </div>
 
       {/* 表格 */}

@@ -13,8 +13,8 @@ export default function StatusBar({ progress, analyzed, onExport, onExportOrigin
     );
   }
 
-  const { total, confirmed, disputed, not_found, unchecked } = progress;
-  const percent = total > 0 ? Math.round(((confirmed + disputed + not_found) / total) * 100) : 0;
+  const { total, confirmed, disputed, unchecked } = progress;
+  const percent = total > 0 ? Math.round(((confirmed + disputed) / total) * 100) : 0;
 
   return (
     <div className="px-4 py-2.5 border-t border-white/5 bg-slate-900/50 backdrop-blur-sm">
@@ -24,7 +24,7 @@ export default function StatusBar({ progress, analyzed, onExport, onExportOrigin
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-slate-400">核对进度</span>
             <span className="text-xs font-mono font-semibold text-white">
-              {confirmed + disputed + not_found}/{total}
+              {confirmed + disputed}/{total}
             </span>
           </div>
 
@@ -46,11 +46,8 @@ export default function StatusBar({ progress, analyzed, onExport, onExportOrigin
           <span className="flex items-center gap-1 text-amber-400">
             🟡 存疑 <b>{disputed}</b>
           </span>
-          <span className="flex items-center gap-1 text-red-400">
-            🔴 未找到 <b>{not_found}</b>
-          </span>
           <span className="flex items-center gap-1 text-slate-400">
-            🔵 未核对 <b>{unchecked}</b>
+             未核对 <b>{unchecked}</b>
           </span>
         </div>
 
@@ -70,12 +67,14 @@ export default function StatusBar({ progress, analyzed, onExport, onExportOrigin
           >
             📥 下载标色原表
           </button>
-          <button
+                    <button
             onClick={onExport}
             disabled={!analyzed}
-            className="px-4 py-1.5 rounded-lg text-sm bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white shadow-lg shadow-emerald-500/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed font-medium flex items-center gap-2"
+            className="px-4 py-1.5 rounded-lg text-sm bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white shadow-lg shadow-emerald-500/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed font-medium flex items-center gap-2 group relative"
+            title="导出报告 (Ctrl+E)"
           >
             📊 下载报告表
+            <kbd className="text-[9px] px-1 py-0.5 rounded bg-emerald-500/30 border border-emerald-400/40 ml-1 opacity-0 group-hover:opacity-100 transition-opacity">Ctrl+E</kbd>
           </button>
         </div>
       </div>

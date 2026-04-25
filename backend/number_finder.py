@@ -66,9 +66,12 @@ class NumberContextFinder:
         
         if unit:
             # text 已经去过空格，但这里仍然保留 \s* 以防万一
-            pattern_str = fr"(?<![0-9.]){re.escape(val_str)}\s*{re.escape(unit)}(?![0-9.])"
+            # 注意：负向前瞻 (?![0-9.]) 必须放在数字后面、单位前面，
+            # 否则当单位后面紧跟数字时（如 "19人19例"），会错误地拒绝匹配
+            pattern_str = fr"(?<![0-9.]){re.escape(val_str)}(?![0-9.])\s*{re.escape(unit)}"
         else:
             pattern_str = fr"(?<![0-9.]){re.escape(val_str)}(?![0-9.])"
+
 
         try:
             pattern = re.compile(pattern_str)
