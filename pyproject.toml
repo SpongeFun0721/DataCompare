@@ -1,0 +1,21 @@
+[project]
+name = "datacompare"
+version = "0.1.0"
+description = "Excel vs PDF 年度报告数值比对工具"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pdfplumber>=0.11.0",
+    "openpyxl>=3.1.0",
+    "rapidfuzz>=3.9.0",
+    "pandas>=2.2.0",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.13.3",
+    "pywin32>=311",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
