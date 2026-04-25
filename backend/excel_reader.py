@@ -172,12 +172,21 @@ def _extract_colors_with_win32com(excel_path: Path, indicators: list[Indicator])
             if not col_idx:
                 ind.bg_color = "无填充"
                 continue
-                
-            color_index = ws.Cells(ind.row_index, col_idx).Interior.ColorIndex
-            if color_index in (-4142, None):  # xlColorIndexNone
+
+            cell = ws.Cells(ind.row_index, col_idx)
+            # 优先使用 DisplayFormat 获取实际显示颜色（支持条件格式）
+            try:
+                display_color_index = cell.DisplayFormat.Interior.ColorIndex
+            except Exception:
+                display_color_index = cell.Interior.ColorIndex
+
+            if display_color_index in (-4142, None):  # xlColorIndexNone
                 ind.bg_color = "无填充"
             else:
-                color_int = int(ws.Cells(ind.row_index, col_idx).Interior.Color)
+                try:
+                    color_int = int(cell.DisplayFormat.Interior.Color)
+                except Exception:
+                    color_int = int(cell.Interior.Color)
                 r = color_int & 0xFF
                 g = (color_int >> 8) & 0xFF
                 b = (color_int >> 16) & 0xFF
