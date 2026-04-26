@@ -61,7 +61,7 @@ function App() {
   // ---- 撤销功能 ----
   const handleUndo = useCallback((action) => {
     if (action.type === 'review_status' && action.indicatorId) {
-      setReviewStatus(action.indicatorId, null);
+      setReviewStatus(action.indicatorId, '未核对');
     }
   }, [setReviewStatus]);
 
@@ -297,22 +297,22 @@ function App() {
             triggerKey={triggerKey}
             analyzing={analyzing}
                                                 onConfirm={(id) => {
-              pushUndo({ type: 'review_status', indicatorId: id, status: '已确认' });
-              setReviewStatus(id, '已确认');
+              pushUndo({ type: 'review_status', indicatorId: id, status: '已核对' });
+              setReviewStatus(id, '已核对');
               // 自动跳转到下一个未核对指标
               setTimeout(() => {
                 const currentIdx = allResults.findIndex(r => r.indicator.id === id);
                 if (currentIdx < 0) return;
                 // 先往后找未核对的
                 for (let i = currentIdx + 1; i < allResults.length; i++) {
-                  if (!allResults[i].indicator.review_status) {
+                  if (allResults[i].indicator.review_status === '未核对') {
                     selectIndicator(allResults[i].indicator.id);
                     return;
                   }
                 }
                 // 再从头找
                 for (let i = 0; i < currentIdx; i++) {
-                  if (!allResults[i].indicator.review_status) {
+                  if (allResults[i].indicator.review_status === '未核对') {
                     selectIndicator(allResults[i].indicator.id);
                     return;
                   }
@@ -322,19 +322,19 @@ function App() {
               }, 150);
             }}
                                                 onDispute={(id) => {
-              pushUndo({ type: 'review_status', indicatorId: id, status: '存疑' });
-              setReviewStatus(id, '存疑');
+              pushUndo({ type: 'review_status', indicatorId: id, status: '未核对' });
+              setReviewStatus(id, '未核对');
               setTimeout(() => {
                 const currentIdx = allResults.findIndex(r => r.indicator.id === id);
                 if (currentIdx < 0) return;
                 for (let i = currentIdx + 1; i < allResults.length; i++) {
-                  if (!allResults[i].indicator.review_status) {
+                  if (allResults[i].indicator.review_status === '未核对') {
                     selectIndicator(allResults[i].indicator.id);
                     return;
                   }
                 }
                 for (let i = 0; i < currentIdx; i++) {
-                  if (!allResults[i].indicator.review_status) {
+                  if (allResults[i].indicator.review_status === '未核对') {
                     selectIndicator(allResults[i].indicator.id);
                     return;
                   }

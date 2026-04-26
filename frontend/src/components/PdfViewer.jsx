@@ -3,8 +3,14 @@ import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 
+
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
+
+console.log('📦 PDF.js 配置:');
+console.log('   版本:', `${pdfjs.version}`);
+console.log('   Worker:', pdfjs.GlobalWorkerOptions.workerSrc);
+console.log('   WASM 路径:', pdfjs.GlobalWorkerOptions.wasmUrl);
 const style = document.createElement('style');
 style.textContent = `
   .pdf-highlight-mark {
@@ -103,11 +109,15 @@ export default function PdfViewer({ pdfUrl, targetPage, highlightText, triggerKe
     }
   }, [currentPage, onPageChange]);
 
-  function onDocumentLoadSuccess(pdf) {
+function onDocumentLoadSuccess(pdf) {
     pdfDocRef.current = pdf;
     setNumPages(pdf.numPages);
+    console.log('✅ PDF 加载成功');
+    console.log('   - 页数:', pdf.numPages);
+    console.log('   - pdfjs 版本:', pdfjs.version);
+    console.log('   - worker 配置:', pdfjs.GlobalWorkerOptions.workerSrc);
     extractPageText(currentPage);
-  }
+}
 
   // 渲染文本层后的自定义高亮逻辑（单 span 匹配）
   // 使用正则匹配，支持单位后缀（如 highlightText="17人" 时匹配 "17"、"17人"、"17例" 等）

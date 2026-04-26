@@ -30,7 +30,7 @@ export function useCompareData() {
   const [selectedPdf, setSelectedPdf] = useState(null);
   const [targetPage, setTargetPage] = useState(1);
   const [highlightText, setHighlightText] = useState('');
-  const [progress, setProgress] = useState({ total: 0, confirmed: 0, disputed: 0, unchecked: 0 });
+  const [progress, setProgress] = useState({ total: 0, confirmed: 0, unchecked: 0 });
 
   const [loading, setLoading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
@@ -62,11 +62,32 @@ export function useCompareData() {
       const colors = data.colors || [];
       setAvailableColors(colors);
       setSelectedColors(colors);
-      // 重置颜色映射，默认全部设为 AI
+      // 重置颜色映射，根据色相判断：
+      // 绿色 → yearbook（年鉴）、蓝色 → report（司局）、红色 → url（AI）
       const defaultMapping = {};
       for (const color of colors) {
-        if (color !== '无填充') {
-          defaultMapping[color] = 'url'; // 默认 AI
+        if (color === '无填充') continue;
+        // 解析 #RRGGBB 判断主色调
+        const hex = color.replace('#', '');
+        const r = parseInt(hex.substring(0, 2), 16);
+        const g = parseInt(hex.substring(2, 4), 16);
+        const b = parseInt(hex.substring(4, 6), 16);
+        
+        // 绿色：G 最高且明显大于 R 和 B
+        if (g > r && g > b && g - Math.max(r, b) > 30) {
+          defaultMapping[color] = 'yearbook';
+        }
+        // 蓝色：B 最高且明显大于 R 和 G
+        else if (b > r && b > g && b - Math.max(r, g) > 30) {
+          defaultMapping[color] = 'report';
+        }
+        // 红色：R 最高且明显大于 G 和 B
+        else if (r > g && r > b && r - Math.max(g, b) > 30) {
+          defaultMapping[color] = 'url';
+        }
+        // 其他颜色（如灰色、黄色等）默认 AI
+        else {
+          defaultMapping[color] = 'url';
         }
       }
       setColorMapping(defaultMapping);
@@ -157,15 +178,26 @@ const selectIndicator = useCallback((id) => {
     const matchedPage = indicatorData.matched_page;
     const matchedSourceType = indicatorData.matched_source_type;
 
-    // 3. 设置 PDF 阅读器
+    // 3. 获取当前指标关联的所有 PDF（从 best_matches 中获取）
+    const bestMatchKeys = Object.keys(bestMatches);
+    // 过滤掉以 core_name 为 key 的项（那些是未匹配到实际文件的）
+    // 保留所有以 .pdf 结尾的 key，以及在 pdfNames 中存在的 key
+    const allRelatedPdfs = bestMatchKeys.filter(key => 
+      key.endsWith('.pdf') || pdfNames.includes(key)
+    );
+    // 如果过滤后为空，但 bestMatchKeys 不为空，说明所有 key 都是 core_name
+    // 此时使用 bestMatchKeys 作为关联列表
+    const relatedPdfs = allRelatedPdfs.length > 0 ? allRelatedPdfs : bestMatchKeys;
+
+    // 4. 设置 PDF 阅读器
     if (matchedSourceType === 'url') {
       // URL 来源 → 不打开 PDF
       setSelectedPdf(null);
       setTargetPage(1);
       setHighlightText(String(indicatorData.target_value));
       console.log('⏭️ URL 来源，不打开 PDF');
-    } else if (matchedPdfName) {
-      // 有来源行指定的 PDF → 始终按来源行页码打开
+    } else if (matchedPdfName && relatedPdfs.includes(matchedPdfName)) {
+      // 有来源行指定的 PDF 且在关联列表中 → 按来源行页码打开
       setSelectedPdf(matchedPdfName);
       setTargetPage(matchedPage || 1);
 
@@ -180,6 +212,27 @@ const selectIndicator = useCallback((id) => {
         setHighlightText(String(indicatorData.target_value));
         console.log(`⚠️ 无数值匹配: pdf=${matchedPdfName}, page=${matchedPage}, highlight=target_value="${indicatorData.target_value}"`);
       }
+    } else if (relatedPdfs.length > 0) {
+      // 有来源行指定的 PDF 但不在关联列表中，或没有来源行信息
+      // 选择第一个关联的 PDF
+      const firstPdf = relatedPdfs[0];
+      setSelectedPdf(firstPdf);
+      // 从 best_matches 中获取该 PDF 的页码
+      const firstMatch = bestMatches[firstPdf];
+      const firstPage = firstMatch?.page_number || matchedPage || 1;
+      setTargetPage(firstPage);
+
+      // 高亮文本
+      if (bestMatch) {
+        const highlightVal = bestMatch.matched_value_raw
+          ?? String(bestMatch.matched_value)
+          ?? String(indicatorData.target_value);
+        setHighlightText(highlightVal);
+        console.log(`✅ 有匹配（首个PDF）: pdf=${firstPdf}, page=${firstPage}, highlight="${highlightVal}"`);
+      } else {
+        setHighlightText(String(indicatorData.target_value));
+        console.log(`⚠️ 无数值匹配（首个PDF）: pdf=${firstPdf}, page=${firstPage}, highlight=target_value="${indicatorData.target_value}"`);
+      }
     } else {
       // 完全没有任何来源信息
       setSelectedPdf(null);
@@ -189,7 +242,7 @@ const selectIndicator = useCallback((id) => {
     }
 
     setTriggerKey(`${id}_${matchedPage || 1}`);
-  }, [allResults]);
+  }, [allResults, pdfNames]);
 
   const selectNextIndicator = useCallback(() => {
     if (selectedId === null || selectedId === undefined || allResults.length === 0) return;
@@ -236,7 +289,7 @@ const selectIndicator = useCallback((id) => {
       setProgress(data.progress);
       
       // 更新本地状态
-      const status = '已确认';
+      const status = '已核对';
       const note = `手动绑定: ${selectedPdf} (第 ${page} 页)`;
       
       setIndicators(prev => prev.map(ind =>

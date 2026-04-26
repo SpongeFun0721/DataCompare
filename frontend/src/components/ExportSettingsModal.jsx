@@ -119,14 +119,14 @@ export default function ExportSettingsModal({ isOpen, onClose, onSave, initialCo
 
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="text-xs" style={{ color: config.font_colors.confirmed }}>已确认</span>
+                <span className="text-xs" style={{ color: config.font_colors.confirmed }}>已核对</span>
               </div>
               <input type="color" value={config.font_colors.confirmed} onChange={e => handleFontChange('confirmed', e.target.value)} className="w-6 h-6 p-0 border-0 rounded cursor-pointer bg-transparent" />
             </div>
 
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="text-xs" style={{ color: config.font_colors.disputed }}>存疑</span>
+                <span className="text-xs" style={{ color: config.font_colors.disputed }}>未核对</span>
               </div>
               <input type="color" value={config.font_colors.disputed} onChange={e => handleFontChange('disputed', e.target.value)} className="w-6 h-6 p-0 border-0 rounded cursor-pointer bg-transparent" />
             </div>

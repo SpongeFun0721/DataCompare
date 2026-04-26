@@ -88,7 +88,7 @@ export async function getMatches(indicatorId) {
 /**
  * 更新指标核对状态
  * @param {number} indicatorId
- * @param {string} status - "已确认" | "存疑"
+ * @param {string} status - "已核对" | "未核对"
  * @param {string} note - 备注
  */
 export async function updateStatus(indicatorId, status, note = '') {

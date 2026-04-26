@@ -18,7 +18,7 @@ const SHORTCUTS = [
   { key: 'ArrowUp',   desc: '↑',   action: '切换到上一个指标' },
   { key: 'ArrowDown', desc: '↓',   action: '切换到下一个指标' },
   { key: 'Enter',     desc: '↵',   action: '确认当前指标' },
-  { key: ' ',         desc: '␣',   action: '标记为争议' },
+  { key: ' ',         desc: '␣',   action: '标记为未核对' },
   { key: 'PageUp',    desc: 'PgUp', action: 'PDF 上一页' },
   { key: 'PageDown',  desc: 'PgDn', action: 'PDF 下一页' },
   { key: '1-4',       desc: '1-4',  action: '切换年份筛选' },
@@ -73,13 +73,13 @@ export function useKeyboardShortcuts({
     if (!currentAllResults?.length) return -1;
     const start = fromIndex + 1;
     for (let i = start; i < currentAllResults.length; i++) {
-      if (!currentAllResults[i].indicator.review_status) {
+      if (currentAllResults[i].indicator.review_status === '未核对') {
         return i;
       }
     }
     // 如果后面没有未核对的，从头开始找
     for (let i = 0; i < fromIndex; i++) {
-      if (!currentAllResults[i].indicator.review_status) {
+      if (currentAllResults[i].indicator.review_status === '未核对') {
         return i;
       }
     }
@@ -111,7 +111,7 @@ export function useKeyboardShortcuts({
     let nextIdx = -1;
     // 先从 currentIdx + 1 往后找
     for (let i = currentIdx + 1; i < currentAllResults.length; i++) {
-      if (!currentAllResults[i].indicator.review_status) {
+      if (currentAllResults[i].indicator.review_status === '未核对') {
         nextIdx = i;
         break;
       }
@@ -119,7 +119,7 @@ export function useKeyboardShortcuts({
     // 如果后面没有，从头找到 currentIdx
     if (nextIdx < 0) {
       for (let i = 0; i < currentIdx; i++) {
-        if (!currentAllResults[i].indicator.review_status) {
+        if (currentAllResults[i].indicator.review_status === '未核对') {
           nextIdx = i;
           break;
         }
@@ -223,15 +223,15 @@ export function useKeyboardShortcuts({
         // Enter 确认
         case 'Enter':
           e.preventDefault();
-          confirmAndAdvance('已确认');
-          showToast('已确认 ✓ 自动跳转', 'success');
+          confirmAndAdvance('已核对');
+          showToast('已核对 ✓ 自动跳转', 'success');
           break;
 
         // Space 争议
         case ' ':
           e.preventDefault();
-          confirmAndAdvance('存疑');
-          showToast('标记为存疑 ⚠', 'warning');
+          confirmAndAdvance('未核对');
+          showToast('标记为未核对 ⚠', 'warning');
           break;
 
         // PgUp PDF 上一页

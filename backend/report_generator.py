@@ -36,9 +36,8 @@ THIN_BORDER = Border(
 )
 
 STATUS_MAP = {
-    "已确认": ("🟢", PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")),
-    "存疑": ("🟡", PatternFill(start_color="FFF8E1", end_color="FFF8E1", fill_type="solid")),
-    "未核对": ("🔵", PatternFill(start_color="E3F2FD", end_color="E3F2FD", fill_type="solid")),
+    "已核对": ("🟢", PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")),
+    "未核对": ("🟡", PatternFill(start_color="FFF8E1", end_color="FFF8E1", fill_type="solid")),
 }
 
 
@@ -93,10 +92,8 @@ def generate_colored_original_excel(
 ) -> Path:
     """
     在原表基础上生成标色版本。
-    绿色（已确认）
-    蓝色（待确认/未核对）
-    黄色（存疑）
-    浅红色（未找到）
+    绿色（已核对）
+    黄色（未核对）
     """
     if output_path is None:
         output_path = OUTPUT_DIR / "标色原表.xlsx"
@@ -115,10 +112,9 @@ def generate_colored_original_excel(
         if cell_val:
             col_name_to_idx[cell_val] = col_idx
 
-    fill_colors = {
-        "已确认": PatternFill(start_color="92D050", end_color="92D050", fill_type="solid"), # 绿色
-        "未核对": PatternFill(start_color="9BC2E6", end_color="9BC2E6", fill_type="solid"), # 蓝色
-        "存疑": PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid"),   # 黄色
+    font_colors = {
+        "已核对": Font(color="000000"),     # 不改变字体
+        "未核对": Font(color="FF6600"),    # 橙色字体（不改背景色，避免覆盖原有分类颜色）
     }
 
     for result in results:
@@ -129,22 +125,21 @@ def generate_colored_original_excel(
         row_idx = ind.row_index
         col_idx = col_name_to_idx.get(ind.col_name) if ind.col_name else None
 
-        # 如果需要根据匹配情况推断“未核对”的状态，可以选择推断
+        # 如果需要根据匹配情况推断"未核对"的状态，可以选择推断
         # 但为保持与 UI 状态同步，这里直接以 review_status 决定颜色
-        # 由于前端名为“未核对”，这里与它对应
+        # 由于前端名为"未核对"，这里与它对应
         status_key = ind.review_status
         # 防止意外的非法状态，默认当做未核对
-        if status_key not in fill_colors:
+        if status_key not in font_colors:
             status_key = "未核对"
 
-        fill_color = fill_colors[status_key]
+        font_color = font_colors[status_key]
 
         if col_idx:
-            ws.cell(row=row_idx, column=col_idx).fill = fill_color
-            # 也可以顺便把指标名那列也标一下，如果能找到
+            ws.cell(row=row_idx, column=col_idx).font = font_color
         else:
             for c in range(1, ws.max_column + 1):
-                ws.cell(row=row_idx, column=c).fill = fill_color
+                ws.cell(row=row_idx, column=c).font = font_color
 
     wb.save(str(output_path))
     logger.info(f"标色原表已生成: {output_path}")

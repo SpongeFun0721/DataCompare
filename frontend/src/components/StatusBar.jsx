@@ -13,8 +13,8 @@ export default function StatusBar({ progress, analyzed, onExport, onExportOrigin
     );
   }
 
-  const { total, confirmed, disputed, unchecked } = progress;
-  const percent = total > 0 ? Math.round(((confirmed + disputed) / total) * 100) : 0;
+  const { total, confirmed, unchecked } = progress;
+  const percent = total > 0 ? Math.round((confirmed / total) * 100) : 0;
 
   return (
     <div className="px-4 py-2.5 border-t border-white/5 bg-slate-900/50 backdrop-blur-sm">
@@ -24,7 +24,7 @@ export default function StatusBar({ progress, analyzed, onExport, onExportOrigin
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-slate-400">核对进度</span>
             <span className="text-xs font-mono font-semibold text-white">
-              {confirmed + disputed}/{total}
+              {confirmed}/{total}
             </span>
           </div>
 
@@ -41,13 +41,10 @@ export default function StatusBar({ progress, analyzed, onExport, onExportOrigin
         {/* 状态统计 */}
         <div className="flex items-center gap-3 mx-4 text-xs">
           <span className="flex items-center gap-1 text-emerald-400">
-            🟢 已确认 <b>{confirmed}</b>
+            🟢 已核对 <b>{confirmed}</b>
           </span>
           <span className="flex items-center gap-1 text-amber-400">
-            🟡 存疑 <b>{disputed}</b>
-          </span>
-          <span className="flex items-center gap-1 text-slate-400">
-             未核对 <b>{unchecked}</b>
+            🟡 未核对 <b>{unchecked}</b>
           </span>
         </div>
 

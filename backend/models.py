@@ -16,6 +16,7 @@ class SourcePage(BaseModel):
     core_name: str | None = Field(default=None, description="PDF 核心文件名（不含 _ocr/_trans 后缀和页码）")
     page: int | None = Field(default=None, description="页码（从 1 开始）")
     url: str | None = Field(default=None, description="URL 地址")
+    year_label: str | None = Field(default=None, description="年份标签，如 '2022年'、'2024年'")
 
 
 class Indicator(BaseModel):
@@ -26,7 +27,7 @@ class Indicator(BaseModel):
     target_value: float = Field(description="Excel 中的目标数值")
     unit: str | None = Field(default=None, description="单位，如'万元'、'元'、'%'")
     aliases: list[str] = Field(default_factory=list, description="指标别名列表")
-    review_status: str = Field(default="未核对", description="核对状态：未核对|已确认|存疑")
+    review_status: str = Field(default="未核对", description="核对状态：未核对|已核对")
     note: str = Field(default="", description="备注")
     year: str = Field(default="", description="对应年份，如'2024年'")
     category1: str = Field(default="", description="一级分类")
@@ -91,8 +92,7 @@ class ProgressInfo(BaseModel):
     """核对进度信息"""
 
     total: int = Field(description="指标总数")
-    confirmed: int = Field(default=0, description="已确认数")
-    disputed: int = Field(default=0, description="存疑数")
+    confirmed: int = Field(default=0, description="已核对数")
     unchecked: int = Field(default=0, description="未核对数")
 
 
@@ -115,7 +115,7 @@ class AnalyzeRequest(BaseModel):
 class StatusUpdate(BaseModel):
     """核对状态更新请求"""
 
-    status: str = Field(description="新状态：已确认|存疑|未核对")
+    status: str = Field(description="新状态：已核对|未核对")
     note: str = Field(default="", description="备注")
 
 

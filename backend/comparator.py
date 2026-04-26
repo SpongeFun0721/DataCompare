@@ -209,16 +209,20 @@ class Comparator:
         seen: set[tuple[str, str | None, int | None]] = set()
         results: list[SourcePage] = []
 
-        # 模式 1：提取 URL
-        url_pattern = re.compile(r'https?://[^\s;；，,\n]+')
+        # 模式 1：提取 URL（同时提取前面的年份标签，如 "2022年："）
+        url_pattern = re.compile(r'(?:(\d{4})\s*年\s*[：:]\s*)?(https?://[^\s;；，,\n]+)')
         for match in url_pattern.finditer(source_file):
-            url = match.group(0).strip()
-            key = ("url", None, None)
+            year_str = match.group(1)  # 年份数字，如 "2022"
+            url = match.group(2).strip()
+            year_label = f"{year_str}年" if year_str else None
+            # 使用 URL 作为 key 的一部分，允许多个不同的 URL
+            key = ("url", url, None)
             if key not in seen:
                 seen.add(key)
                 results.append(SourcePage(
                     source_type="url",
                     url=url,
+                    year_label=year_label,
                 ))
 
         # 模式 2：提取 +P页码
@@ -252,40 +256,96 @@ class Comparator:
     # PDF 文件名匹配
     # ============================================================
 
+    # 定义忽略词（这些词的变化不影响核心身份）
+    IGNORE_WORDS = [
+        '关于', '报送', '报告', '请示', '思路', '重点', '打算',
+        '及', '与', '和',  # 连词归一化
+        '年度', '年终', '的', '情况', '工作','（盖章版）'  # 常见但无区分的词
+    ]
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """归一化文本：去噪、统一连词、去除非核心特征"""
+        # 1. 去除后缀
+        text = re.sub(r'(_ocr|_trans)?\.pdf$', '', text)
+        
+        # 2. 去除编号前缀 (如 "10.")
+        text = re.sub(r'^\d+\.', '', text)
+        
+        # 3. 统一连词：将所有连词(及/与)替换为"和"
+        text = text.replace('及', '和').replace('与', '和')
+        
+        # 4. 去除忽略词
+        for word in Comparator.IGNORE_WORDS:
+            text = text.replace(word, '')
+        
+        # 5. 去除多余空格
+        text = re.sub(r'\s+', '', text)
+        
+        return text
+
+    @staticmethod
+    def _extract_key_elements(name: str) -> dict:
+        """提取关键元素：机构名、年份对"""
+        # 提取机构名 (协会/中心/司/大学等)
+        org_match = re.search(r'([\u4e00-\u9fa5]+(?:协会|中心|司|大学|集团|基金会|学校|报社|俱乐部|联合会))', name)
+        org = org_match.group(1) if org_match else ""
+        
+        # 提取年份对（两个连续的4位数字）
+        years = re.findall(r'(\d{4})', name)
+        year_pair = tuple(years[:2]) if len(years) >= 2 else ()
+        
+        return {
+            'org': org,
+            'year_pair': year_pair,
+            'normalized': Comparator._normalize(name)
+        }
+
     @staticmethod
     def _match_pdf_name(core_name: str, pdf_names: list[str]) -> str | None:
         """
         根据 core_name 在 pdf_names 中查找匹配的实际 PDF 文件名。
-
-        年鉴：core_name 如 "中国体育年鉴2022"，在 pdf_names 中做包含匹配
-        司局报告：core_name 如 "33.反兴奋剂中心关于2023年工作总结和2024年工作计划的报告"，
-                 在 pdf_names 中做包含匹配（可能带 _ocr.pdf 或 _trans.pdf 后缀）
+        使用机构名+年份对+归一化文本相似度综合打分。
         """
-        # 精确匹配
-        if core_name in pdf_names:
-            return core_name
-
-        # 包含匹配：core_name 是 pdf_name 的子串，或反之
+        # 提取 core_name 的关键元素
+        core_elem = Comparator._extract_key_elements(core_name)
+        
+        best_match = None
+        best_score = 0
+        
         for pdf_name in pdf_names:
-            if core_name in pdf_name or pdf_name in core_name:
-                return pdf_name
-
-        # 前缀匹配：core_name 的前 10 个字符匹配
-        short_name = core_name[:10]
-        for pdf_name in pdf_names:
-            if short_name in pdf_name or pdf_name[:10] in core_name:
-                return pdf_name
-
-        # 年份匹配：如果 core_name 包含年份，在 pdf_names 中找包含相同年份的文件
-        # 例如 core_name="中国体育年鉴2022" → 匹配 "年鉴2022.pdf"
-        year_match = re.search(r'(\d{4})', core_name)
-        if year_match:
-            year_str = year_match.group(1)
-            for pdf_name in pdf_names:
-                if year_str in pdf_name:
-                    return pdf_name
-
-        return None
+            pdf_elem = Comparator._extract_key_elements(pdf_name)
+            score = 0
+            
+            # 1. 机构名完全匹配 (权重 40)
+            if core_elem['org'] and core_elem['org'] == pdf_elem['org']:
+                score += 40
+            elif core_elem['org'] and pdf_elem['org'] and core_elem['org'] in pdf_elem['org']:
+                score += 20  # 部分匹配（如"中国足协" vs "中国足球协会"）
+            
+            # 2. 年份对完全匹配 (权重 50，最高)
+            if core_elem['year_pair'] and core_elem['year_pair'] == pdf_elem['year_pair']:
+                score += 50
+            elif len(core_elem['year_pair']) == 2 and len(pdf_elem['year_pair']) == 2:
+                # 部分年份匹配（2022→2023 vs 2022→2024）得分较低
+                if core_elem['year_pair'][0] == pdf_elem['year_pair'][0]:
+                    score += 25
+                if core_elem['year_pair'][1] == pdf_elem['year_pair'][1]:
+                    score += 25
+            
+            # 3. 归一化后的文本相似度（基于字符交集比例）
+            common_len = len(set(core_elem['normalized']) & set(pdf_elem['normalized']))
+            max_len = max(len(core_elem['normalized']), len(pdf_elem['normalized']))
+            if max_len > 0:
+                score += (common_len / max_len) * 30
+            
+            # 更新最佳匹配
+            if score > best_score:
+                best_score = score
+                best_match = pdf_name
+        
+        # 阈值：至少 30 分才认为是有效匹配（避免乱匹配）
+        return best_match if best_score >= 30 else None
 
     # ============================================================
     # 年份匹配
@@ -295,7 +355,10 @@ class Comparator:
     def _is_year_match(ind_year: str, pdf_name: str) -> bool:
         """
         判断指标所属年份是否与 PDF 文件名中的年份匹配。
-        - 以前面的年份为准（例如 2022-2023 取 2022）
+        - 司局报告文件名通常包含两个年份（如 "2022年工作总结和2023年工作计划"），
+          只使用前面的年份（总结年份）进行匹配
+        - 例如 PDF 名为 "10.中国击剑协会关于报送2022年工作总结和2023年工作计划的报告_ocr.pdf"
+          前面的年份为 2022，指标年份为 2022 时应匹配成功
         - 如果无法提取年份，则默认匹配（返回 True）
         """
         if not ind_year:
@@ -307,12 +370,15 @@ class Comparator:
 
         target_year = ind_match.group(1)
 
-        pdf_match = re.search(r"(\d{4})", pdf_name)
-        if not pdf_match:
+        # 提取 PDF 文件名中所有年份
+        pdf_years = re.findall(r"(\d{4})", pdf_name)
+        if not pdf_years:
             return True
 
-        pdf_year = pdf_match.group(1)
-        return target_year == pdf_year
+        # 只使用前面的年份（总结年份）进行匹配
+        first_year = pdf_years[0]
+        return target_year == first_year
+
 
     # ============================================================
     # 核心比对方法
@@ -340,7 +406,14 @@ class Comparator:
 
         result = IndicatorResult(indicator=indicator)
 
-        # 确定唯一来源（三个字段互斥）
+        # ============================================================
+        # 确定来源类型和来源文本
+        # 颜色映射决定了该指标使用 source_file 中的哪部分内容：
+        #   - report: 只处理司局报告（+P页码，不含"年鉴"）
+        #   - yearbook: 只处理年鉴（+P页码，含"年鉴"）
+        #   - url: 只处理 URL
+        # 三个字段互斥，由 /api/analyze 根据 color_mapping 设置
+        # ============================================================
         if indicator.source_file_yearbook:
             source_type = "yearbook"
             source_text = indicator.source_file_yearbook
@@ -351,9 +424,9 @@ class Comparator:
             source_type = "url"
             source_text = indicator.source_file_url
         else:
-            # 无来源 → 存疑
-            print(f"    ⚠️ [{indicator.name}] 无任何来源字段，标记为存疑")
-            indicator.review_status = "存疑"
+            # 无来源 → 未核对（无法自动判断，留待用户核对）
+            print(f"    ⚠️ [{indicator.name}] 无任何来源字段，标记为未核对")
+            indicator.review_status = "未核对"
             return result
 
         # 解析来源文本
@@ -368,87 +441,128 @@ class Comparator:
             print(f"      [{sp.source_type}] core_name='{sp.core_name}', page={sp.page}, url={sp.url}")
 
         if not source_pages:
-            print(f"    ⚠️ 来源文本为空或无法解析，标记为存疑")
-            indicator.review_status = "存疑"
+            print(f"    ⚠️ 来源文本为空或无法解析，标记为未核对")
+            indicator.review_status = "未核对"
             return result
 
-        for sp in source_pages:
+        # ============================================================
+        # 根据颜色映射的 source_type 过滤 source_pages
+        # 例如：颜色映射为 "url"，则只处理 URL 来源，忽略 PDF 来源
+        # 例如：颜色映射为 "report"，则只处理 report 来源，忽略 URL 和 yearbook
+        # ============================================================
+        # 只处理与 source_type 匹配的来源
+        filtered_pages = [sp for sp in source_pages if sp.source_type == source_type]
+
+        # 如果过滤后为空，说明 source_file 中不包含该类型的来源
+        if not filtered_pages:
+            print(f"    ⚠️ 来源文本中未找到 {source_type} 类型的来源")
+            # 但仍然记录所有解析出的来源到 best_matches，以便前端显示
+            for sp in source_pages:
+                key = sp.url if sp.source_type == "url" else sp.core_name
+                if key:
+                    result.best_matches[key] = None
+            indicator.review_status = "未核对"
+            return result
+
+        # 标记是否有 PDF 来源被成功处理
+        has_pdf_processed = False
+
+        for sp in filtered_pages:
             if sp.source_type == "url":
                 print(f"    ⏭️ URL 来源，跳过: {sp.url}")
                 indicator.matched_source_type = "url"
                 continue
 
-            # 匹配实际 PDF 文件名
             if sp.source_type == "yearbook" and yearbook_index:
-                # 年鉴：使用 yearbook_index 按年份匹配
-                # 从 core_name 中提取年份（如 "中国体育年鉴2022" → "2022"）
+                # 年鉴特判：不按年份严格匹配
+                # 2022 年鉴也可能包含 2021 的数据，所以直接根据 AI 来源行显示对应的年鉴
+                # 优先从 core_name 中提取年份匹配
                 year_match = re.search(r'(\d{4})', sp.core_name)
                 if year_match:
                     year_str = year_match.group(1)
                     matched_name = yearbook_index.get(year_str)
-                    if not matched_name:
-                        # 尝试用指标年份匹配
-                        ind_year_match = re.search(r'(\d{4})', indicator.year)
-                        if ind_year_match:
-                            matched_name = yearbook_index.get(ind_year_match.group(1))
-                    if not matched_name:
-                        # 使用默认年鉴
-                        matched_name = yearbook_index.get("default")
-                else:
-                    # core_name 无年份，用指标年份匹配
+                if not matched_name:
+                    # 尝试用指标年份匹配
                     ind_year_match = re.search(r'(\d{4})', indicator.year)
                     if ind_year_match:
                         matched_name = yearbook_index.get(ind_year_match.group(1))
-                    if not matched_name:
-                        # 使用默认年鉴
-                        matched_name = yearbook_index.get("default")
+                if not matched_name:
+                    # 使用默认年鉴
+                    matched_name = yearbook_index.get("default")
+                if not matched_name and yearbook_index:
+                    # 兜底：取第一个可用的年鉴
+                    matched_name = list(yearbook_index.values())[0]
             else:
                 # 司局报告：使用原有的匹配逻辑
                 matched_name = self._match_pdf_name(sp.core_name, pdf_names)
 
             if not matched_name:
                 print(f"    ⏭️ [{sp.core_name}] 未匹配到任何 PDF 文件")
+                # 仍然记录到 best_matches，标记为 None，以便前端知道这个来源
+                result.best_matches[sp.core_name] = None
                 continue
 
             if matched_name not in self._cache:
                 print(f"    ⏭️ [{matched_name}] 不在缓存中")
+                # 仍然记录到 best_matches，标记为 None，以便前端知道这个 PDF 被关联了
+                result.best_matches[matched_name] = None
                 continue
 
-            # 年份过滤
-            if not self._is_year_match(indicator.year, matched_name):
-                print(f"    ⏭️ [{matched_name}] 年份不匹配: indicator.year='{indicator.year}'")
-                continue
+            # 年份过滤（仅对司局报告生效，年鉴特判不按年份过滤）
+            if sp.source_type != "yearbook":
+                if not self._is_year_match(indicator.year, matched_name):
+                    print(f"    ⏭️ [{matched_name}] 年份不匹配: indicator.year='{indicator.year}'")
+                    # 仍然记录到 best_matches，标记为 None，以便前端知道这个 PDF 被关联了
+                    result.best_matches[matched_name] = None
+                    continue
 
-            print(f"    ✅ [{matched_name}] 第 {sp.page} 页 开始匹配...")
-            matches = self._find_matches_on_page(indicator, matched_name, sp.page)
+            # 在指定页及前后一页查找匹配，取最先匹配到的页码
+            pages_to_try = [sp.page]
+            if sp.page > 1:
+                pages_to_try.append(sp.page - 1)
+            pages_to_try.append(sp.page + 1)
 
-            result.matches[matched_name] = matches
+            matched_page = None
+            all_matches: list[MatchResult] = []
+            for try_page in pages_to_try:
+                print(f"    ✅ [{matched_name}] 第 {try_page} 页 开始匹配...")
+                page_matches = self._find_matches_on_page(indicator, matched_name, try_page)
+                if page_matches:
+                    matched_page = try_page
+                    all_matches = page_matches
+                    print(f"    ✅ [{matched_name}] 第 {try_page} 页 匹配成功（最先匹配到的页码）")
+                    break
+                else:
+                    print(f"    ❌ [{matched_name}] 第 {try_page} 页 未找到匹配")
+
+            result.matches[matched_name] = all_matches
 
             # 无论是否匹配到数值，都记录来源信息到 indicator 级别
             indicator.matched_source_type = sp.source_type
             indicator.matched_pdf_name = matched_name
-            indicator.matched_page = sp.page
+            indicator.matched_page = matched_page or sp.page
+            has_pdf_processed = True
 
             # 取置信度最高的作为 best match
-            if matches:
-                best = max(matches, key=lambda m: m.confidence)
+            if all_matches:
+                best = max(all_matches, key=lambda m: m.confidence)
                 result.best_matches[matched_name] = best
             else:
                 result.best_matches[matched_name] = None
 
-        # 自动判断状态
+        # 自动判断状态：匹配到的自动已核对，未匹配到的保持未核对（留待用户判断）
         has_any = any(m is not None for m in result.best_matches.values())
         if not has_any:
-            indicator.review_status = "存疑"
+            indicator.review_status = "未核对"
         else:
             # 统计所有 PDF 中的绝对数值匹配（is_match 为 True）数量
             exact_matches = []
             for pdf_matches in result.matches.values():
                 exact_matches.extend([m for m in pdf_matches if m.is_match])
 
-            # 若全局仅出现 1 次完全匹配，且置信度较高，则自动确认为"已确认"
+            # 若全局仅出现 1 次完全匹配，且置信度较高，则自动确认为"已核对"
             if len(exact_matches) == 1 and exact_matches[0].confidence >= 70.0:
-                indicator.review_status = "已确认"
+                indicator.review_status = "已核对"
 
         return result
 
@@ -818,15 +932,13 @@ class Comparator:
 
     @staticmethod
     def _calc_progress(indicators: list[Indicator]) -> ProgressInfo:
-        """计算核对进度。"""
+        """计算核对进度。仅统计已核对。"""
         total = len(indicators)
-        confirmed = sum(1 for i in indicators if i.review_status == "已确认")
-        disputed = sum(1 for i in indicators if i.review_status == "存疑")
-        unchecked = total - confirmed - disputed
+        confirmed = sum(1 for i in indicators if i.review_status == "已核对")
+        unchecked = total - confirmed
 
         return ProgressInfo(
             total=total,
             confirmed=confirmed,
-            disputed=disputed,
             unchecked=unchecked,
         )

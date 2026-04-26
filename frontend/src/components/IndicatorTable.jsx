@@ -11,9 +11,8 @@
 import { useState, useMemo, useEffect, useRef } from 'react';
 
 const STATUS_ICONS = {
-  '未核对': { icon: '🔵', bg: 'bg-blue-500/10', text: 'text-blue-400' },
-  '已确认': { icon: '🟢', bg: 'bg-emerald-500/10', text: 'text-emerald-400' },
-  '存疑':   { icon: '🟡', bg: 'bg-amber-500/10', text: 'text-amber-400' },
+  '已核对': { icon: '🟢', bg: 'bg-emerald-500/10', text: 'text-emerald-400' },
+  '未核对': { icon: '🟡', bg: 'bg-amber-500/10', text: 'text-amber-400' },
 };
 
 export default function IndicatorTable({ indicators, selectedId, onSelect, allResults, pdfNames, yearFilter = '全部' }) {
@@ -38,6 +37,14 @@ export default function IndicatorTable({ indicators, selectedId, onSelect, allRe
   }, [indicators, search, yearFilter]);
 
   // 获取指标的匹配概况
+  // 根据指标的 source_file_* 字段推断来源类型
+  const getSourceLabel = (ind) => {
+    if (ind.source_file_yearbook) return '年鉴';
+    if (ind.source_file_report) return '司局';
+    if (ind.source_file_url) return 'AI';
+    return null;
+  };
+
   const getMatchSummary = (indicatorId) => {
     const result = allResults.find(r => r.indicator.id === indicatorId);
     if (!result) return null;
@@ -118,11 +125,24 @@ export default function IndicatorTable({ indicators, selectedId, onSelect, allRe
                   <td className="px-3 py-3">
                     <div className="flex items-center gap-1.5">
                       <span className="font-medium text-slate-200 leading-tight">{ind.name}</span>
-                      {ind.year && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400 border border-purple-500/20 whitespace-nowrap">
-                          {ind.year}
-                        </span>
-                      )}
+                      {ind.year && (() => {
+                        const sourceLabel = getSourceLabel(ind);
+                        const displayText = sourceLabel ? `${ind.year.replace('年', '')}年${sourceLabel}` : ind.year;
+                        // 根据来源类型选择颜色
+                        let badgeStyle = 'bg-purple-500/15 text-purple-400 border-purple-500/20'; // 默认
+                        if (sourceLabel === '年鉴') {
+                          badgeStyle = 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20';
+                        } else if (sourceLabel === '司局') {
+                          badgeStyle = 'bg-blue-500/15 text-blue-400 border-blue-500/20';
+                        } else if (sourceLabel === 'AI') {
+                          badgeStyle = 'bg-amber-500/15 text-amber-400 border-amber-500/20';
+                        }
+                        return (
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded ${badgeStyle} whitespace-nowrap`}>
+                            {displayText}
+                          </span>
+                        );
+                      })()}
                     </div>
                     {ind.unit && (
                       <span className="text-xs text-slate-500">({ind.unit})</span>

@@ -19,7 +19,7 @@ const SHORTCUTS_GROUPS = [
     title: '核对操作',
     items: [
       { keys: ['↵'], desc: '确认当前指标' },
-      { keys: ['␣'], desc: '标记为存疑' },
+      { keys: ['␣'], desc: '标记为未核对' },
     ],
   },
   {
@@ -113,7 +113,7 @@ export default function ShortcutsPanel({ isOpen, onClose }) {
         {/* 底部提示 */}
         <div className="px-5 py-3 border-t border-white/10 bg-slate-900/50">
           <p className="text-xs text-slate-500">
-            💡 提示：操作（确认/存疑）后将自动跳转到下一个未核对的指标
+            💡 提示：操作（确认/未核对）后将自动跳转到下一个未核对的指标
           </p>
         </div>
       </div>
