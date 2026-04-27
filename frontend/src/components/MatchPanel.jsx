@@ -8,6 +8,68 @@ import { getPdfUrl } from '../api';
 // 确保 worker 已配置（PdfViewer 中已配置，这里复用）
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
+// ============================================================
+// IndexedDB 本地缓存工具 —— 将 PDF 数据存储在浏览器本地
+// 避免每次刷新页面都重新从服务器下载，减轻服务器压力
+// ============================================================
+const DB_NAME = 'pdf-cache';
+const DB_VERSION = 1;
+const STORE_NAME = 'pdfs';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        // 使用 pdfName 作为 key，存储 ArrayBuffer
+        db.createObjectStore(STORE_NAME, { keyPath: 'pdfName' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getFromCache(pdfName) {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(pdfName);
+      req.onsuccess = () => {
+        const result = req.result;
+        if (result) {
+          // 从 ArrayBuffer 重建 Blob
+          const blob = new Blob([result.data], { type: 'application/pdf' });
+          resolve(blob);
+        } else {
+          resolve(null);
+        }
+      };
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function saveToCache(pdfName, arrayBuffer) {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      store.put({ pdfName, data: arrayBuffer });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // 静默失败，不影响主流程
+  }
+}
+
 export default function MatchPanel({
   currentMatches,
   pdfNames,
@@ -62,7 +124,7 @@ export default function MatchPanel({
 
   // ============================================================
   // PDF 预加载策略：
-  // - 司局 PDF（最多 4 个）：使用 fetch + Blob URL 预加载，切换时秒开
+  // - 司局 PDF（最多 4 个）：使用 IndexedDB 本地缓存，切换时秒开
   // - 年鉴 PDF：按需加载（不预加载）
   // ============================================================
   const isYearbook = React.useCallback((name) => name.includes('年鉴'), []);
@@ -73,32 +135,51 @@ export default function MatchPanel({
     return pdfNames.filter(name => !isYearbook(name)).slice(0, 4);
   }, [pdfNames, isYearbook]);
 
-  // Blob URL 缓存：pdfName -> blobUrl
+  // IndexedDB 本地缓存：pdfName -> Blob
   const [pdfBlobCache, setPdfBlobCache] = React.useState({});
 
-  // 预加载司局 PDF：用 fetch 下载数据并创建 Blob URL
+  // 预加载司局 PDF：优先从 IndexedDB 读取，未命中则从服务器下载并缓存到本地
   React.useEffect(() => {
     let cancelled = false;
-    const cache = {};
 
     async function preloadAll() {
+      const cache = {};
+
       for (const name of preloadPdfNames) {
         if (cancelled) return;
+
+        // 1. 优先从 IndexedDB 本地缓存读取
+        const cachedBlob = await getFromCache(name);
+        if (cachedBlob) {
+          const blobUrl = URL.createObjectURL(cachedBlob);
+          cache[name] = blobUrl;
+          console.log(`📦 PDF 从本地缓存加载: ${name} (${cachedBlob.size} bytes)`);
+          continue;
+        }
+
+        // 2. 本地未命中，从服务器下载
         try {
           const url = getPdfUrl(name);
           const resp = await fetch(url);
           if (!resp.ok) {
-            console.warn(`⚠️ PDF 预加载失败: ${name} (HTTP ${resp.status})`);
+            console.warn(`⚠️ PDF 下载失败: ${name} (HTTP ${resp.status})`);
             continue;
           }
-          const blob = await resp.blob();
+          const arrayBuffer = await resp.arrayBuffer();
+          const blob = new Blob([arrayBuffer], { type: 'application/pdf' });
           const blobUrl = URL.createObjectURL(blob);
           cache[name] = blobUrl;
-          console.log(`📦 PDF 预加载成功 (Blob URL): ${name} (${blob.size} bytes)`);
+          console.log(`📦 PDF 下载成功: ${name} (${blob.size} bytes)`);
+
+          // 3. 存入 IndexedDB 本地缓存，下次直接读取
+          saveToCache(name, arrayBuffer).then(() => {
+            console.log(`💾 PDF 已缓存到本地: ${name}`);
+          });
         } catch (err) {
-          console.warn(`⚠️ PDF 预加载异常: ${name}`, err);
+          console.warn(`⚠️ PDF 下载异常: ${name}`, err);
         }
       }
+
       if (!cancelled) {
         setPdfBlobCache(cache);
       }
@@ -113,7 +194,7 @@ export default function MatchPanel({
     };
   }, [preloadPdfNames]); // 注意：这里故意不依赖 pdfBlobCache，避免循环
 
-  // 获取当前 PDF 的 URL（优先使用缓存的 Blob URL）
+  // 获取当前 PDF 的 URL（优先使用本地缓存的 Blob URL）
   const pdfUrl = React.useMemo(() => {
     if (!selectedPdf) return null;
     // 如果已缓存，使用 Blob URL（秒开）
@@ -143,11 +224,20 @@ export default function MatchPanel({
     const indYearMatch = indicator.year.match(/(\d{4})/);
     if (!indYearMatch) return;
     const indYear = indYearMatch[1];
+
     // 查找 year_label 匹配的 URL
     const matchedIdx = urlSources.findIndex(sp => {
-      if (!sp.year_label) return false;
-      const spYearMatch = sp.year_label.match(/(\d{4})/);
-      return spYearMatch && spYearMatch[1] === indYear;
+      // 1. 优先从 year_label 匹配
+      if (sp.year_label) {
+        const spYearMatch = sp.year_label.match(/(\d{4})/);
+        if (spYearMatch && spYearMatch[1] === indYear) return true;
+      }
+      // 2. 其次从 URL 字符串中提取年份匹配
+      if (sp.url) {
+        const urlYearMatch = sp.url.match(/(\d{4})/);
+        if (urlYearMatch && urlYearMatch[1] === indYear) return true;
+      }
+      return false;
     });
     if (matchedIdx >= 0 && matchedIdx !== selectedUrlIndex) {
       setSelectedUrlIndex(matchedIdx);
@@ -249,6 +339,7 @@ export default function MatchPanel({
             urlSources={urlSources}
             selectedUrlIndex={selectedUrlIndex}
             onUrlIndexChange={setSelectedUrlIndex}
+            indicator={indicator}
           />
         </div>
       </div>
@@ -274,6 +365,7 @@ function PdfViewerWithPreload({
   urlSources,
   selectedUrlIndex,
   onUrlIndexChange,
+  indicator,
 }) {
   const [numPages, setNumPages] = React.useState(null);
   const [currentPage, setCurrentPage] = React.useState(targetPage || 1);
@@ -284,12 +376,6 @@ function PdfViewerWithPreload({
   const [extractedText, setExtractedText] = React.useState('');
   const [showTextPanel, setShowTextPanel] = React.useState(true);
   const [loadError, setLoadError] = React.useState(null);
-
-  // AI（URL）来源的状态
-  const [webText, setWebText] = React.useState('');
-  const [webTitle, setWebTitle] = React.useState('');
-  const [webLoading, setWebLoading] = React.useState(false);
-  const [webError, setWebError] = React.useState(null);
 
   // 提取页面文本
   const extractPageText = React.useCallback(async (pageNum) => {
@@ -490,56 +576,154 @@ function PdfViewerWithPreload({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [selection]);
 
-  // AI（URL）来源：通过后端代理获取网页纯文本
+  // AI（URL）来源：一次性对所有 URL 发起请求并缓存
+  // urlCache: { url: { text, title } }
+  const [urlCache, setUrlCache] = React.useState({});
+  const [urlLoading, setUrlLoading] = React.useState(false);
+
   React.useEffect(() => {
-    if (!isUrlSource || !urlSource?.url) return;
+    if (!isUrlSource || urlSources.length === 0) return;
     let cancelled = false;
-    setWebLoading(true);
-    setWebError(null);
-    const proxyUrl = `/api/proxy-url?url=${encodeURIComponent(urlSource.url)}`;
-    fetch(proxyUrl)
+
+    // 找出尚未缓存的 URL
+    const uncachedUrls = urlSources
+      .map(sp => sp.url)
+      .filter(url => url && !urlCache[url]);
+
+    if (uncachedUrls.length === 0) {
+      // 全部已缓存，直接使用缓存
+      return;
+    }
+
+    setUrlLoading(true);
+
+    // 一次性批量请求所有未缓存的 URL
+    const params = new URLSearchParams();
+    uncachedUrls.forEach(url => params.append('urls', url));
+    fetch(`/api/proxy-urls?${params.toString()}`, { method: 'POST' })
       .then(resp => {
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp.json();
       })
       .then(data => {
-        if (!cancelled) {
-          setWebText(data.text || '');
-          setWebTitle(data.title || '');
-          setWebLoading(false);
-        }
+        if (cancelled) return;
+        const newCache = { ...urlCache };
+        (data.results || []).forEach(item => {
+          newCache[item.url] = { text: item.text || '', title: item.title || '' };
+        });
+        setUrlCache(newCache);
+        setUrlLoading(false);
       })
       .catch(err => {
-        if (!cancelled) {
-          setWebError(err.message);
-          setWebLoading(false);
-        }
+        if (cancelled) return;
+        console.error('批量获取 URL 失败:', err);
+        setUrlLoading(false);
       });
-    return () => { cancelled = true; };
-  }, [isUrlSource, urlSource?.url]);
 
-  // 高亮逻辑：在文本中查找 highlightText
-  const renderHighlightedText = React.useCallback((text, highlight) => {
+    return () => { cancelled = true; };
+  }, [isUrlSource, urlSources]); // 注意：不依赖 urlCache，避免循环
+
+  // ============================================================
+  // AI 分析状态
+  // ============================================================
+  const [aiAnalyzing, setAiAnalyzing] = React.useState(false);
+  const [aiResult, setAiResult] = React.useState(null);
+  const [aiError, setAiError] = React.useState(null);
+
+  // 调用 AI 分析
+  const runAiAnalysis = React.useCallback(async () => {
+    if (!indicator || !urlSource?.url) return;
+    setAiAnalyzing(true);
+    setAiResult(null);
+    setAiError(null);
+
+    try {
+      const resp = await fetch('/api/ai-analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          indicator_id: indicator.id,
+          category1: indicator.category1 || '',
+          category2: indicator.category2 || '',
+          category3: indicator.name || '',
+          indicator_name: indicator.name,
+          target_value: indicator.target_value,
+          unit: indicator.unit,
+          url: urlSource.url,
+        }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || `HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      setAiResult(data.result);
+    } catch (err) {
+      setAiError(err.message);
+    } finally {
+      setAiAnalyzing(false);
+    }
+  }, [indicator, urlSource]);
+
+  // 从缓存中获取当前 URL 的数据
+  const cachedData = React.useMemo(() => {
+    if (!urlSource?.url) return null;
+    return urlCache[urlSource.url] || null;
+  }, [urlSource, urlCache]);
+
+  const webText = cachedData?.text || '';
+  const webTitle = cachedData?.title || '';
+  const webLoading = urlLoading && !cachedData;
+  const webError = !urlLoading && !cachedData && urlSource?.url ? '加载失败' : null;
+
+  // 高亮逻辑：在文本中精确匹配 highlightText（只高亮匹配到的部分，而非整行）
+  // isUrlContext 参数控制使用哪种高亮样式：
+  //   - true: 使用 url-highlight-mark（深色，用于 URL 网页文本）
+  //   - false: 使用 pdf-highlight-mark（浅色，用于 PDF 文本层）
+  const renderHighlightedText = React.useCallback((text, highlight, isUrlContext = false) => {
     if (!highlight) return text;
     const target = String(highlight).replace(/[\s\u3000]/g, '');
     if (!target) return text;
     const numMatch = target.match(/[\d,]+\.?\d*/);
     const matchNum = numMatch ? numMatch[0].replace(/,/g, '') : null;
-    
-    // 按行处理，每行独立高亮
+    const highlightClass = isUrlContext ? 'url-highlight-mark' : 'pdf-highlight-mark';
+
+    // 对每一行，找到匹配的精确位置并包裹 <mark>
     return text.split('\n').map((line, idx) => {
       const spacelessLine = line.replace(/[\s\u3000]/g, '');
-      let shouldHighlight = false;
+      
+      // 构建匹配模式
+      let pattern = null;
       if (spacelessLine.includes(target)) {
-        shouldHighlight = true;
+        // 精确文本匹配：找到原行中对应的位置
+        pattern = target;
       } else if (matchNum) {
-        const regex = new RegExp(`(?<![0-9.,])${matchNum.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^0-9.,]*`);
-        if (regex.test(spacelessLine)) shouldHighlight = true;
+        // 数字匹配：匹配数值（含千分位逗号）
+        const escapedNum = matchNum.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        pattern = new RegExp(`(?<![0-9.,])${escapedNum}(?:[0-9,]*\\.?[0-9]*)?(?![0-9.,])`);
       }
-      if (shouldHighlight) {
-        return `<span class="text-panel-highlight">${line}</span>`;
+
+      if (!pattern) return line;
+
+      try {
+        if (typeof pattern === 'string') {
+          // 精确文本匹配：在原始行中查找包含目标文本的部分
+          // 由于原始行有空格/全角空格，需要模糊匹配
+          const regex = new RegExp(
+            target.split('').map(c => {
+              if (/[\s\u3000]/.test(c)) return '\\s*';
+              return c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            }).join('\\s*'),
+            'gi'
+          );
+          return line.replace(regex, match => `<mark class="${highlightClass}">${match}</mark>`);
+        } else {
+          // 数字匹配
+          return line.replace(pattern, match => `<mark class="${highlightClass}">${match}</mark>`);
+        }
+      } catch {
+        return line;
       }
-      return line;
     }).join('\n');
   }, []);
 
@@ -567,6 +751,33 @@ function PdfViewerWithPreload({
             {webTitle && <span className="text-xs text-slate-500 truncate max-w-[200px]">{webTitle}</span>}
           </div>
           <div className="flex items-center gap-2">
+            {/* AI 分析按钮 */}
+            <button
+              onClick={runAiAnalysis}
+              disabled={aiAnalyzing}
+              className={`px-2 py-1 text-xs rounded border transition-colors flex items-center gap-1 ${
+                aiAnalyzing
+                  ? 'bg-purple-500/10 text-purple-400/50 border-purple-500/20 cursor-not-allowed'
+                  : aiResult
+                    ? 'bg-purple-500/20 text-purple-400 border-purple-500/30 hover:bg-purple-500/30'
+                    : 'bg-purple-500/15 text-purple-400 border-purple-500/25 hover:bg-purple-500/25'
+              }`}
+              title="使用 DeepSeek AI 分析网页文本中是否存在该指标数据"
+            >
+              {aiAnalyzing ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  AI 分析中...
+                </>
+              ) : aiResult ? (
+                <>🤖 重新分析</>
+              ) : (
+                <>🤖 AI 分析</>
+              )}
+            </button>
             <a
               href={urlSource.url}
               target="_blank"
@@ -595,7 +806,7 @@ function PdfViewerWithPreload({
               <div
                 className="text-xs text-slate-300 leading-relaxed whitespace-pre-wrap font-mono break-all"
                 dangerouslySetInnerHTML={{
-                  __html: renderHighlightedText(webText, highlightText)
+                  __html: renderHighlightedText(webText, highlightText, true)
                 }}
               />
             )}
@@ -608,7 +819,8 @@ function PdfViewerWithPreload({
                 <span className="text-xs text-slate-400 font-medium">📝 信息面板</span>
                 <button onClick={() => setShowTextPanel(false)} className="text-slate-500 hover:text-slate-300 text-xs">✕</button>
               </div>
-              <div className="flex-1 overflow-auto p-3">
+              <div className="flex-1 overflow-auto p-3 space-y-3">
+                {/* 基本信息 */}
                 <div className="text-xs text-slate-500">
                   <p className="mb-2">网页正文已提取纯文本</p>
                   <p className="text-slate-600">查找目标值:</p>
@@ -620,6 +832,86 @@ function PdfViewerWithPreload({
                     </>
                   )}
                 </div>
+
+                {/* AI 分析结果 */}
+                {(aiResult || aiError || aiAnalyzing) && (
+                  <div className="border-t border-white/10 pt-3">
+                    <p className="text-xs text-slate-400 font-medium mb-2">🤖 AI 分析结果</p>
+                    
+                    {aiAnalyzing && (
+                      <div className="flex items-center gap-2 text-xs text-purple-400">
+                        <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                        <span>DeepSeek 正在分析...</span>
+                      </div>
+                    )}
+
+                    {aiError && (
+                      <div className="text-xs text-red-400 bg-red-500/10 rounded p-2 border border-red-500/20">
+                        ❌ 分析失败: {aiError}
+                      </div>
+                    )}
+
+                    {aiResult && (
+                      <div className="space-y-2">
+                        {/* 数据存在状态 */}
+                        <div className={`text-xs px-2 py-1 rounded ${
+                          aiResult.exists
+                            ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/20'
+                            : 'bg-amber-500/15 text-amber-400 border border-amber-500/20'
+                        }`}>
+                          {aiResult.exists ? '✅ 数据存在' : '❌ 数据不存在'}
+                          <span className="ml-2 opacity-70">(置信度: {aiResult.confidence})</span>
+                        </div>
+
+                        {/* 匹配文本 */}
+                        {aiResult.matched_text && (
+                          <div className="text-xs">
+                            <p className="text-slate-600 mb-0.5">匹配文本:</p>
+                            <p className="text-slate-300 bg-slate-800/50 rounded p-1.5 text-[10px] leading-relaxed break-all">
+                              {aiResult.matched_text}
+                            </p>
+                          </div>
+                        )}
+
+                        {/* 匹配数值 */}
+                        {aiResult.matched_value !== null && aiResult.matched_value !== undefined && (
+                          <div className="text-xs">
+                            <span className="text-slate-600">匹配数值: </span>
+                            <span className="text-amber-400 font-mono">{aiResult.matched_value}</span>
+                          </div>
+                        )}
+
+                        {/* 运算逻辑 */}
+                        {aiResult.calculation && (
+                          <div className="text-xs">
+                            <p className="text-slate-600 mb-0.5">🧮 运算逻辑:</p>
+                            <p className="text-purple-400 bg-purple-500/10 rounded p-1.5 text-[10px] leading-relaxed">
+                              {aiResult.calculation}
+                            </p>
+                            {aiResult.calculation_detail && (
+                              <p className="text-slate-400 mt-1 text-[10px] leading-relaxed">
+                                {aiResult.calculation_detail}
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                        {/* 分析说明 */}
+                        {aiResult.explanation && (
+                          <div className="text-xs">
+                            <p className="text-slate-600 mb-0.5">分析说明:</p>
+                            <p className="text-slate-400 text-[10px] leading-relaxed">
+                              {aiResult.explanation}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
               <div className="px-3 py-1.5 border-t border-white/5 text-xs text-slate-600 break-all">
                 {webText.length} 字符 | {urlSource.url}

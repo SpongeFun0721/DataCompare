@@ -24,15 +24,17 @@ import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from urllib.parse import quote
 
-from backend.config import UPLOAD_DIR, OUTPUT_DIR, DATA_DIR
+from backend.config import UPLOAD_DIR, OUTPUT_DIR, DATA_DIR, BASE_DIR
 from backend.models import (
     AnalysisResponse, StatusUpdate, IndicatorResult, ProgressInfo, AnalyzeRequest, ManualBinding,
 )
 from backend.excel_reader import read_indicators
 from backend.comparator import Comparator
 from backend.report_generator import generate_report, generate_colored_original_excel
+from backend.ai_analyzer import AIAnalyzer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -631,79 +633,58 @@ async def serve_pdf(filename: str):
 
 # ============================================================
 # 7. URL 代理接口（用于 AI 来源的网页文本提取）
+#     使用 RequestController + WebTextExtractor 进行限流控制
 # ============================================================
+from backend.request_controller import WebTextExtractor, RequestController, RateLimitConfig
+
+# 全局 WebTextExtractor 实例（带域名限流配置）
+_web_extractor = WebTextExtractor(
+    controller=RequestController(
+        max_concurrent=3,                    # 最多 3 个并发
+        default_rate=5.0,                    # 默认每秒 5 个请求
+        retry_max=2,                         # 最多重试 2 次
+        timeout=30.0,                        # 超时 30 秒
+        domain_configs={
+            # 针对体育类政府网站的限流配置
+            "fencing.sport.org.cn": RateLimitConfig(
+                requests_per_second=2,       # 每秒最多 2 个请求
+                burst_size=3,                # 突发容量 3
+                min_interval=0.5,            # 最小间隔 0.5 秒
+            ),
+            "www.sport.gov.cn": RateLimitConfig(
+                requests_per_second=3,
+                burst_size=5,
+            ),
+            "www.gov.cn": RateLimitConfig(
+                requests_per_second=3,
+                burst_size=5,
+            ),
+        },
+    ),
+    max_lines=500,
+    max_chars=50000,
+)
+
+
+@app.post("/api/proxy-urls")
+async def proxy_urls(urls: list[str] = Query(...)):
+    """
+    批量代理获取多个 URL 的内容，通过 WebTextExtractor 限流获取并缓存。
+    返回 JSON：{ "results": [{ "url": ..., "text": ..., "title": ... }, ...] }
+    """
+    results = await _web_extractor.extract_batch(urls)
+    return {"results": results}
+
+
 @app.get("/api/proxy-url")
 async def proxy_url(url: str = Query(..., description="要代理获取的 URL")):
     """
     代理获取指定 URL 的内容，提取网页正文纯文本。
+    通过 WebTextExtractor 限流获取并缓存。
     返回 JSON：{ "url": ..., "text": ..., "title": ... }
-    前端用文本面板展示，支持高亮。
     """
-    import httpx
-    from bs4 import BeautifulSoup
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            })
-            content_type = resp.headers.get("content-type", "")
-            title = ""
-            text = ""
-            if "text/html" in content_type or "application/xhtml" in content_type:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # 提取标题
-                if soup.title:
-                    title = soup.title.get_text(strip=True)
-                # 移除 script、style、nav、footer、header、aside 等非正文元素
-                for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript", "iframe", "svg", "form", "button"]):
-                    tag.decompose()
-                # 提取正文文本
-                body = soup.find("body")
-                if body:
-                    text = body.get_text(separator="\n", strip=True)
-                else:
-                    text = soup.get_text(separator="\n", strip=True)
-                # 清理多余空行
-                lines = [line.strip() for line in text.split("\n") if line.strip()]
-                text = "\n".join(lines[:500])  # 最多 500 行
-            else:
-                # 非 HTML 内容，直接返回文本
-                text = resp.text[:50000]
-            
-            return {
-                "url": url,
-                "title": title,
-                "text": text,
-            }
-    except ImportError:
-        # 如果没有 BeautifulSoup，使用简单的正则提取
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                resp = await client.get(url, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                })
-                import re
-                # 简单提取 body 内容
-                body_match = re.search(r'<body[^>]*>(.*?)</body>', resp.text, re.DOTALL | re.IGNORECASE)
-                if body_match:
-                    text = re.sub(r'<[^>]+>', '', body_match.group(1))
-                else:
-                    text = re.sub(r'<[^>]+>', '', resp.text)
-                lines = [line.strip() for line in text.split("\n") if line.strip()]
-                text = "\n".join(lines[:500])
-                return {
-                    "url": url,
-                    "title": "",
-                    "text": text,
-                }
-        except Exception as e2:
-            logger.exception(f"代理 URL 失败(回退): {url}")
-            raise HTTPException(502, f"代理获取 URL 失败: {e2}")
-    except Exception as e:
-        logger.exception(f"代理 URL 失败: {url}")
-        raise HTTPException(502, f"代理获取 URL 失败: {e}")
+    result = await _web_extractor.extract(url)
+    return result
 
 
 # ============================================================
@@ -814,3 +795,118 @@ def _calc_progress(analysis: AnalysisResponse) -> ProgressInfo:
         confirmed=confirmed,
         unchecked=total - confirmed,
     )
+
+
+# ============================================================
+# 8. AI 分析接口 —— 使用 DeepSeek API 分析 URL 网页文本
+# ============================================================
+# 全局 AIAnalyzer 实例
+_ai_analyzer = AIAnalyzer()
+
+
+@app.post("/api/ai-analyze")
+async def ai_analyze(body: dict):
+    """
+    使用 DeepSeek AI 分析 URL 网页文本中是否存在指标数据。
+
+    请求体：
+    {
+        "indicator_id": int,           # 指标 ID
+        "category1": str,              # 一级标题
+        "category2": str,              # 二级标题
+        "category3": str,              # 三级标题
+        "indicator_name": str,         # 数据项名称
+        "target_value": float | None,  # 目标数值
+        "unit": str | None,            # 单位
+        "url": str,                    # 目标 URL
+    }
+
+    返回：
+    {
+        "indicator_id": int,
+        "url": str,
+        "result": {
+            "exists": bool,
+            "confidence": str,
+            "matched_text": str | None,
+            "matched_value": float | None,
+            "calculation": str | None,
+            "calculation_detail": str | None,
+            "explanation": str,
+        }
+    }
+    """
+    indicator_id = body.get("indicator_id")
+    category1 = body.get("category1", "")
+    category2 = body.get("category2", "")
+    category3 = body.get("category3", "")
+    indicator_name = body.get("indicator_name", "")
+    target_value = body.get("target_value")
+    unit = body.get("unit")
+    url = body.get("url", "")
+
+    if not indicator_name:
+        raise HTTPException(400, "缺少 indicator_name")
+    if not url:
+        raise HTTPException(400, "缺少 url")
+
+    # 1. 获取 URL 网页文本
+    logger.info(f"AI 分析: 获取 URL 网页文本: {url[:80]}...")
+    web_result = await _web_extractor.extract(url)
+    web_text = web_result.get("text", "")
+
+    if not web_text or web_text.startswith("获取失败"):
+        return {
+            "indicator_id": indicator_id,
+            "url": url,
+            "result": {
+                "exists": False,
+                "confidence": "low",
+                "matched_text": None,
+                "matched_value": None,
+                "calculation": None,
+                "calculation_detail": None,
+                "explanation": f"无法获取 URL 内容: {web_text}",
+            }
+        }
+
+    # 2. 调用 AI 分析
+    logger.info(f"AI 分析: 调用 DeepSeek API 分析指标: {indicator_name}")
+    result = await _ai_analyzer.analyze(
+        category1=category1,
+        category2=category2,
+        category3=category3,
+        indicator_name=indicator_name,
+        target_value=target_value,
+        unit=unit,
+        web_text=web_text,
+    )
+
+    return {
+        "indicator_id": indicator_id,
+        "url": url,
+        "result": result,
+    }
+
+
+# ============================================================
+# 生产模式：挂载前端静态文件
+# 当 dist 目录存在时，提供前端 SPA 静态文件服务
+# ============================================================
+FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
+
+if FRONTEND_DIST.exists():
+    # 挂载静态资源（assets/ 等）
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="frontend_assets")
+
+    # 提供 SPA 入口（所有非 API 路由返回 index.html）
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_frontend(full_path: str):
+        # 如果路径以 /api/ 开头，交给 API 路由处理
+        if full_path.startswith("api/"):
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        index_path = FRONTEND_DIST / "index.html"
+        if index_path.exists():
+            return HTMLResponse(content=index_path.read_text(encoding="utf-8"))
+        return HTMLResponse(status_code=404, content="<h1>404 Not Found</h1>")

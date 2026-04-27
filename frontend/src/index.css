@@ -140,11 +140,39 @@ body {
 
 /* 高亮样式 */
 mark {
-  background-color: rgba(250, 204, 21, 0.5); /* tailwind yellow-400 with opacity */
+  background-color: rgba(250, 204, 21, 0.25); /* 更浅的黄色背景，不遮挡文字 */
   color: inherit;
-  padding: 0;
+  padding: 0 1px;
   border-radius: 2px;
-  box-shadow: 0 0 4px rgba(250, 204, 21, 0.6);
+  box-shadow: 0 0 2px rgba(250, 204, 21, 0.3);
+}
+
+/* PDF 高亮 mark（在 PDF 文本层上使用，颜色浅，不遮挡文字） */
+.pdf-highlight-mark {
+  background-color: rgba(250, 204, 21, 0.2) !important;
+  color: inherit !important;
+  padding: 0 1px !important;
+  border-radius: 2px !important;
+  box-shadow: 0 0 2px rgba(250, 204, 21, 0.25) !important;
+}
+
+/* URL 网页文本高亮 mark（颜色更深，便于在白色/浅色背景上突出） */
+.url-highlight-mark {
+  background-color: rgba(250, 204, 21, 0.55) !important;
+  color: #1a1a2e !important;
+  padding: 0 2px !important;
+  border-radius: 3px !important;
+  box-shadow: 0 0 4px rgba(250, 204, 21, 0.5) !important;
+  font-weight: 600 !important;
+}
+
+/* 文本面板高亮（在识别文本面板中使用） */
+.text-panel-highlight {
+  background-color: rgba(250, 204, 21, 0.3);
+  color: inherit;
+  padding: 0 1px;
+  border-radius: 2px;
+  box-shadow: 0 0 2px rgba(250, 204, 21, 0.3);
 }
 
 .tooltip-wrap {

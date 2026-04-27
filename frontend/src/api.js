@@ -226,3 +226,23 @@ export async function saveManualBinding(indicatorId, pdfName, page, text) {
     }),
   });
 }
+
+/**
+ * AI 分析 —— 使用 DeepSeek API 分析 URL 网页文本中是否存在指标数据
+ * @param {Object} params
+ * @param {number} params.indicator_id - 指标 ID
+ * @param {string} params.category1 - 一级标题
+ * @param {string} params.category2 - 二级标题
+ * @param {string} params.category3 - 三级标题
+ * @param {string} params.indicator_name - 数据项名称
+ * @param {number|null} params.target_value - 目标数值
+ * @param {string|null} params.unit - 单位
+ * @param {string} params.url - 目标 URL
+ * @returns {Promise<Object>} AI 分析结果
+ */
+export async function aiAnalyze(params) {
+  return request('/ai-analyze', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}

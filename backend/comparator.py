@@ -209,8 +209,8 @@ class Comparator:
         seen: set[tuple[str, str | None, int | None]] = set()
         results: list[SourcePage] = []
 
-        # 模式 1：提取 URL（同时提取前面的年份标签，如 "2022年："）
-        url_pattern = re.compile(r'(?:(\d{4})\s*年\s*[：:]\s*)?(https?://[^\s;；，,\n]+)')
+        # 模式 1：提取 URL（同时提取前面的年份标签，如 "2022年：" 或 "2025："）
+        url_pattern = re.compile(r'(?:(\d{4})\s*(?:年\s*)?[：:]\s*)?(https?://[^\s;；，,\n]+)')
         for match in url_pattern.finditer(source_file):
             year_str = match.group(1)  # 年份数字，如 "2022"
             url = match.group(2).strip()
