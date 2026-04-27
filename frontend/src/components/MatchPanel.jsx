@@ -87,6 +87,7 @@ export default function MatchPanel({
   onManualBind,
   onPdfPageChange,
   onPdfNumPagesChange,
+  onSaveComment,
 }) {
   const indicator = currentMatches?.indicator;
 
@@ -290,6 +291,7 @@ export default function MatchPanel({
         onNotFound={onNotFound}
         onPrev={onPrev}
         onNext={onNext}
+        onSaveComment={onSaveComment}
       />
 
       {/* 数值不一致警告 */}

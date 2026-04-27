@@ -19,12 +19,20 @@ class SourcePage(BaseModel):
     year_label: str | None = Field(default=None, description="年份标签，如 '2022年'、'2024年'")
 
 
+class MultiSourceValue(BaseModel):
+    """指标中的多来源数值项（如"年报:200 报告:300"中的一项）"""
+    source_hint: str = Field(description="来源提示，如'年报'、'报告'")
+    target_value: float = Field(description="提取出的数值")
+    raw_text: str = Field(description="原始文本，如'年报:200'")
+
+
 class Indicator(BaseModel):
     """Excel 中的一条指标记录"""
 
     id: int = Field(description="指标序号（自动生成）")
     name: str = Field(description="指标名称（三级分类或拼接分类）")
-    target_value: float = Field(description="Excel 中的目标数值")
+    target_value: float = Field(description="Excel 中的目标数值（用于比对，从原始文本中提取的数字）")
+    display_value: str | None = Field(default=None, description="前端显示用的原始单元格完整文本（所有格式均保留）")
     unit: str | None = Field(default=None, description="单位，如'万元'、'元'、'%'")
     aliases: list[str] = Field(default_factory=list, description="指标别名列表")
     review_status: str = Field(default="未核对", description="核对状态：未核对|已核对")
@@ -32,6 +40,8 @@ class Indicator(BaseModel):
     year: str = Field(default="", description="对应年份，如'2024年'")
     category1: str = Field(default="", description="一级分类")
     category2: str = Field(default="", description="二级分类")
+    raw_target: str | None = Field(default=None, description="原始单元格文本值（已弃用，保留兼容性）")
+    is_numeric: bool = Field(default=True, description="原始值是否包含可提取的数字")
     row_index: int | None = Field(default=None, description="原始Excel中的行号(1-based)")
     col_name: str | None = Field(default=None, description="原始Excel中目标数值所在的列名")
     bg_color: str | None = Field(default=None, description="单元格背景颜色(十六进制，无填充为'无填充')")
@@ -43,6 +53,8 @@ class Indicator(BaseModel):
     matched_source_type: str | None = Field(default=None, description="实际匹配到的来源类型: yearbook | report | url")
     matched_pdf_name: str | None = Field(default=None, description="实际匹配到的 PDF 文件名")
     matched_page: int | None = Field(default=None, description="实际匹配到的页码")
+    multi_source_values: list[MultiSourceValue] = Field(default_factory=list, description="从原始文本中解析出的多来源数值列表（如'年报:200','报告:300'）")
+    extracted_display: str | None = Field(default=None, description="前端显示的文本（包含特殊字符的完整原始值，如'400+'、'近500'）")
 
 
 class NumberMatch(BaseModel):

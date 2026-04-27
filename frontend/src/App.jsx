@@ -33,7 +33,7 @@ function App() {
     upload, analyze,
     selectIndicator, selectNextIndicator, selectPrevIndicator, setReviewStatus, handleManualBind,
         setSelectedPdf, setTargetPage,
-    doExport, doExportOriginal, setError, toggleColor, setColorMapping,
+    doExport, doExportOriginal, saveComment, setError, toggleColor, setColorMapping,
   } = useCompareData();
 
     const excelInputRef = useRef(null);
@@ -300,6 +300,7 @@ function App() {
             highlightText={highlightText}
             triggerKey={triggerKey}
             analyzing={analyzing}
+            onSaveComment={saveComment}
                                                 onConfirm={(id) => {
               pushUndo({ type: 'review_status', indicatorId: id, status: '已核对' });
               setReviewStatus(id, '已核对');

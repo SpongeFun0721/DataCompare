@@ -345,7 +345,16 @@ const selectIndicator = useCallback((id) => {
     }
   }, []);
 
+  // ---- 保存批注 ----
+  const saveComment = useCallback(async (indicatorId, comment) => {
+    // 使用已有的 setReviewStatus 方法，保持当前状态不变，只更新 note
+    const indicator = indicators.find(ind => ind.id === indicatorId);
+    if (!indicator) return;
+    await setReviewStatus(indicatorId, indicator.review_status, comment);
+  }, [indicators, setReviewStatus]);
+
   // ---- 切换选中颜色 ----
+
   const toggleColor = useCallback((color) => {
     setSelectedColors(prev =>
       prev.includes(color)
@@ -367,7 +376,7 @@ const selectIndicator = useCallback((id) => {
     upload, analyze,
     selectIndicator, selectNextIndicator, selectPrevIndicator, setReviewStatus, handleManualBind,
     setSelectedPdf, setTargetPage,
-    doExport, doExportOriginal,
+    doExport, doExportOriginal, saveComment,
     setError, toggleColor, setColorMapping,
   };
 }

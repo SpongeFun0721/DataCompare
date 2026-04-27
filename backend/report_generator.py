@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -136,10 +137,23 @@ def generate_colored_original_excel(
         font_color = font_colors[status_key]
 
         if col_idx:
-            ws.cell(row=row_idx, column=col_idx).font = font_color
+            target_cell = ws.cell(row=row_idx, column=col_idx)
+            target_cell.font = font_color
         else:
             for c in range(1, ws.max_column + 1):
                 ws.cell(row=row_idx, column=c).font = font_color
+            target_cell = ws.cell(row=row_idx, column=1)
+
+        # ---- 写入批注（comment） ----
+        # 如果 indicator.note 不为空，则在目标单元格上添加批注
+        if ind.note and ind.note.strip():
+            comment = Comment(
+                text=ind.note.strip(),
+                author="核对人员",
+            )
+            comment.width = 300
+            comment.height = 100
+            target_cell.comment = comment
 
     wb.save(str(output_path))
     logger.info(f"标色原表已生成: {output_path}")
@@ -180,7 +194,7 @@ def _create_summary_sheet(wb: Workbook, results: list[IndicatorResult], pdf_name
     headers = [
         "序号", "年份", "一级标题", "二级标题", "三级标题（指标名称）",
         "Excel目标值", "单位", "核对情况", "匹配值", "是否一致",
-        "匹配PDF", "匹配页码", "数据来源",
+        "匹配PDF", "匹配页码", "数据来源", "批注",
     ]
 
     for col, h in enumerate(headers, 1):
@@ -206,8 +220,9 @@ def _create_summary_sheet(wb: Workbook, results: list[IndicatorResult], pdf_name
         # 三级标题（指标名称）
         ws.cell(row=row_idx, column=5, value=ind.name)
 
-        # Excel目标值
-        ws.cell(row=row_idx, column=6, value=ind.target_value)
+        # Excel目标值（非数字则显示原始文本）
+        excel_value = ind.raw_target if (not ind.is_numeric and ind.raw_target) else ind.target_value
+        ws.cell(row=row_idx, column=6, value=excel_value)
 
         # 单位
         ws.cell(row=row_idx, column=7, value=ind.unit or "")
@@ -254,6 +269,19 @@ def _create_summary_sheet(wb: Workbook, results: list[IndicatorResult], pdf_name
         # 数据来源（source_file）
         ws.cell(row=row_idx, column=13, value=ind.source_file or "")
 
+        # 批注
+        note_cell = ws.cell(row=row_idx, column=14, value=ind.note or "")
+        if ind.note and ind.note.strip():
+            # 在指标名称单元格也添加 Excel 批注（作为悬停提示）
+            name_cell = ws.cell(row=row_idx, column=5)
+            comment = Comment(
+                text=ind.note.strip(),
+                author="核对人员",
+            )
+            comment.width = 300
+            comment.height = 100
+            name_cell.comment = comment
+
         # 行边框
         for col in range(1, len(headers) + 1):
             ws.cell(row=row_idx, column=col).border = THIN_BORDER
@@ -267,7 +295,7 @@ def _create_pdf_detail_sheet(wb: Workbook, results: list[IndicatorResult], pdf_n
     ws = wb.create_sheet(title=short_name)
 
     headers = ["指标名称", "Excel值", "匹配值", "原始字符串", "页码",
-               "置信度", "是否一致", "差值", "上下文原文"]
+               "置信度", "是否一致", "差值", "上下文原文", "批注"]
 
     for col, h in enumerate(headers, 1):
         ws.cell(row=1, column=col, value=h)
@@ -276,17 +304,19 @@ def _create_pdf_detail_sheet(wb: Workbook, results: list[IndicatorResult], pdf_n
     row_idx = 2
     for result in results:
         matches = result.matches.get(pdf_name, [])
+        ind = result.indicator
         if not matches:
-            ws.cell(row=row_idx, column=1, value=result.indicator.name)
-            ws.cell(row=row_idx, column=2, value=result.indicator.target_value)
+            ws.cell(row=row_idx, column=1, value=ind.name)
+            ws.cell(row=row_idx, column=2, value=ind.target_value)
             ws.cell(row=row_idx, column=3, value="未找到")
             ws.cell(row=row_idx, column=3).fill = NOT_FOUND_FILL
+            ws.cell(row=row_idx, column=10, value=ind.note or "")
             row_idx += 1
             continue
 
         for m in matches:
-            ws.cell(row=row_idx, column=1, value=result.indicator.name)
-            ws.cell(row=row_idx, column=2, value=result.indicator.target_value)
+            ws.cell(row=row_idx, column=1, value=ind.name)
+            ws.cell(row=row_idx, column=2, value=ind.target_value)
             ws.cell(row=row_idx, column=3, value=m.matched_value)
             ws.cell(row=row_idx, column=4, value=m.matched_value_raw)
             ws.cell(row=row_idx, column=5, value=m.page_number)
@@ -301,6 +331,7 @@ def _create_pdf_detail_sheet(wb: Workbook, results: list[IndicatorResult], pdf_n
 
             ws.cell(row=row_idx, column=8, value=m.difference)
             ws.cell(row=row_idx, column=9, value=m.context)
+            ws.cell(row=row_idx, column=10, value=ind.note or "")
 
             for col in range(1, len(headers) + 1):
                 ws.cell(row=row_idx, column=col).border = THIN_BORDER
@@ -314,13 +345,14 @@ def _create_not_found_sheet(wb: Workbook, results: list[IndicatorResult], pdf_na
     """创建未找到项 Sheet。"""
     ws = wb.create_sheet(title="未找到项")
 
-    headers = ["指标名称", "Excel值", "单位", "未匹配的PDF"]
+    headers = ["指标名称", "Excel值", "单位", "未匹配的PDF", "批注"]
     for col, h in enumerate(headers, 1):
         ws.cell(row=1, column=col, value=h)
     _apply_header_style(ws, 1, len(headers))
 
     row_idx = 2
     for result in results:
+        ind = result.indicator
         missing_pdfs = []
         for pdf_name in pdf_names:
             best = result.best_matches.get(pdf_name)
@@ -328,10 +360,12 @@ def _create_not_found_sheet(wb: Workbook, results: list[IndicatorResult], pdf_na
                 missing_pdfs.append(pdf_name)
 
         if missing_pdfs:
-            ws.cell(row=row_idx, column=1, value=result.indicator.name)
-            ws.cell(row=row_idx, column=2, value=result.indicator.target_value)
-            ws.cell(row=row_idx, column=3, value=result.indicator.unit or "")
+            ws.cell(row=row_idx, column=1, value=ind.name)
+            excel_value = ind.raw_target if (not ind.is_numeric and ind.raw_target) else ind.target_value
+            ws.cell(row=row_idx, column=2, value=excel_value)
+            ws.cell(row=row_idx, column=3, value=ind.unit or "")
             ws.cell(row=row_idx, column=4, value=", ".join(missing_pdfs))
+            ws.cell(row=row_idx, column=5, value=ind.note or "")
 
             for col in range(1, len(headers) + 1):
                 ws.cell(row=row_idx, column=col).border = THIN_BORDER

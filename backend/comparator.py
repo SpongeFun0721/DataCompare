@@ -440,6 +440,29 @@ class Comparator:
         for sp in source_pages:
             print(f"      [{sp.source_type}] core_name='{sp.core_name}', page={sp.page}, url={sp.url}")
 
+        # ============================================================
+        # 多来源数值处理（如"年报:200 报告:300"）
+        # 构建 source_type → sub_value 的映射
+        # ============================================================
+        effective_target = indicator.target_value
+        selected_sub_value = None
+        if indicator.multi_source_values:
+            print(f"    检测到多来源数值 ({len(indicator.multi_source_values)} 项):")
+            for msv in indicator.multi_source_values:
+                # 拼接年份和来源提示，如 "2022年年报"、"2024年报告"
+                combined_key = f"{indicator.year}{msv.source_hint}"
+                print(f"      源: '{msv.source_hint}' → 值={msv.target_value}, 组合键='{combined_key}'")
+                # 检查该组合键是否出现在当前 source_text 中
+                if source_text and combined_key in source_text:
+                    effective_target = msv.target_value
+                    selected_sub_value = msv
+                    print(f"      ✅ 在当前来源文本中找到 '{combined_key}'，使用子值 {msv.target_value}")
+                    break
+            if selected_sub_value:
+                print(f"    最终使用的 effective_target: {effective_target} (来自 multi_source_values)")
+            else:
+                print(f"    ⚠️ 未在来源文本中找到匹配的多来源项，使用主值 {effective_target}")
+
         if not source_pages:
             print(f"    ⚠️ 来源文本为空或无法解析，标记为未核对")
             indicator.review_status = "未核对"
@@ -524,16 +547,22 @@ class Comparator:
 
             matched_page = None
             all_matches: list[MatchResult] = []
-            for try_page in pages_to_try:
-                print(f"    ✅ [{matched_name}] 第 {try_page} 页 开始匹配...")
-                page_matches = self._find_matches_on_page(indicator, matched_name, try_page)
-                if page_matches:
-                    matched_page = try_page
-                    all_matches = page_matches
-                    print(f"    ✅ [{matched_name}] 第 {try_page} 页 匹配成功（最先匹配到的页码）")
-                    break
-                else:
-                    print(f"    ❌ [{matched_name}] 第 {try_page} 页 未找到匹配")
+
+            if not indicator.is_numeric:
+                # 非数值指标：不进行数值匹配，仅记录来源信息
+                print(f"    ⏭️ [{matched_name}] 第 {sp.page} 页 非数值指标，跳过数值匹配（raw_target='{indicator.raw_target}'）")
+                matched_page = sp.page
+            else:
+                for try_page in pages_to_try:
+                    print(f"    ✅ [{matched_name}] 第 {try_page} 页 开始匹配...")
+                    page_matches = self._find_matches_on_page(indicator, matched_name, try_page)
+                    if page_matches:
+                        matched_page = try_page
+                        all_matches = page_matches
+                        print(f"    ✅ [{matched_name}] 第 {try_page} 页 匹配成功（最先匹配到的页码）")
+                        break
+                    else:
+                        print(f"    ❌ [{matched_name}] 第 {try_page} 页 未找到匹配")
 
             result.matches[matched_name] = all_matches
 
@@ -560,9 +589,39 @@ class Comparator:
             for pdf_matches in result.matches.values():
                 exact_matches.extend([m for m in pdf_matches if m.is_match])
 
+            # 检查是否存在多种来源类型（如 report + yearbook + url），混合来源不应自动确认
+            source_types_in_use = set(sp.source_type for sp in source_pages)
+            has_mixed_sources = len(source_types_in_use) > 1
+
+            if has_mixed_sources:
+                print(f"    [自动确认] ⚠️ 存在多来源类型 ({source_types_in_use})，跳过自动确认")
+            elif indicator.multi_source_values:
+                print(f"    [自动确认] ⚠️ 存在多来源数值，跳过自动确认")
+            elif len(exact_matches) != 1:
+                print(f"    [自动确认] 精确匹配数={len(exact_matches)}，不是恰好1个，跳过自动确认")
+            elif exact_matches[0].confidence < 70.0:
+                print(f"    [自动确认] 置信度={exact_matches[0].confidence} < 70，跳过自动确认")
+
             # 若全局仅出现 1 次完全匹配，且置信度较高，则自动确认为"已核对"
-            if len(exact_matches) == 1 and exact_matches[0].confidence >= 70.0:
+            # 但以下情况除外，需要用户手动核对：
+            #   - 存在多种来源类型（report + yearbook + url 混合）
+            #   - 存在多来源数值（multi_source_values）
+            if not has_mixed_sources and not indicator.multi_source_values and len(exact_matches) == 1 and exact_matches[0].confidence >= 70.0:
                 indicator.review_status = "已核对"
+                print(f"    [自动确认] ✅ 自动确认: 唯一匹配, confidence={exact_matches[0].confidence}")
+            else:
+                print(f"    [自动确认] 最终 review_status 保持为 '{indicator.review_status}'")
+
+        # ======== 最终状态汇总 ========
+        print(f"    [状态汇总] 最终 review_status='{indicator.review_status}' | "
+              f"matched_source_type='{indicator.matched_source_type}' | "
+              f"best_matches count={len(result.best_matches)}")
+        for pdf_name, best in result.best_matches.items():
+            if best is not None:
+                print(f"       ✅ '{pdf_name}' → value={best.matched_value}, confidence={best.confidence}, is_match={best.is_match}")
+            else:
+                print(f"       ❌ '{pdf_name}' → 无匹配")
+        print(f"    <<< compare_indicator 结束: [{indicator.name}]")
 
         return result
 
@@ -605,9 +664,7 @@ class Comparator:
             print(f"      [{i}] value={num.value}, raw_str='{num.raw_str}', pos={num.position}")
             print(f"          context: ...{num.context[max(0, num.position-50):num.position+50]}...")
 
-        if not target_numbers:
-            print(f"    ❌ 第 {page_number} 页未找到数值匹配")
-            return []
+        # (target_numbers 为空时已在上方提前 return，此处不会执行)
 
         # 对每个值匹配做模糊匹配验证
         scored: list[tuple[ExtractedNumber, float]] = []
@@ -649,6 +706,12 @@ class Comparator:
             highlighted = self._highlight_context(
                 num.context, indicator.name, num.raw_str, indicator.aliases
             )
+
+            print(f"      [结果 {idx+1}/{len(deduplicated)}] matched_value={num.value}, "
+                  f"fuzzy_score={fuzzy_score:.1f}, confidence={confidence:.1f}, "
+                  f"is_match={is_match}, diff={difference}")
+            if num.unit:
+                print(f"        单位={num.unit}")
 
             results.append(MatchResult(
                 pdf_name=pdf_name,
@@ -796,10 +859,14 @@ class Comparator:
         Returns:
             (是否一致, 差值)
         """
+        print(f"      [值比对] pdf_value={pdf_value}, pdf_unit={pdf_unit}, excel_value={excel_value}, excel_unit={excel_unit}")
+
         # 如果单位相同或都为 None，直接比较
         if pdf_unit == excel_unit:
             diff = abs(pdf_value - excel_value)
-            return diff <= self.tolerance, pdf_value - excel_value
+            result = diff <= self.tolerance
+            print(f"      [值比对] 单位相同，diff={diff:.4f}, is_match={result}")
+            return result, pdf_value - excel_value
 
         # 尝试单位换算后比较
         from backend.config import UNIT_MULTIPLIERS
@@ -809,20 +876,26 @@ class Comparator:
 
         if pdf_unit and pdf_unit in UNIT_MULTIPLIERS:
             pdf_base = pdf_value * UNIT_MULTIPLIERS[pdf_unit]
+            print(f"      [值比对] PDF单位换算: {pdf_value} × {UNIT_MULTIPLIERS[pdf_unit]} = {pdf_base}")
         if excel_unit and excel_unit in UNIT_MULTIPLIERS:
             excel_base = excel_value * UNIT_MULTIPLIERS[excel_unit]
+            print(f"      [值比对] Excel单位换算: {excel_value} × {UNIT_MULTIPLIERS[excel_unit]} = {excel_base}")
 
         # 先尝试同单位比较（不换算）
         diff_raw = abs(pdf_value - excel_value)
         if diff_raw <= self.tolerance:
+            print(f"      [值比对] 同单位不换算匹配成功，diff={diff_raw:.4f}")
             return True, pdf_value - excel_value
 
         # 再尝试换算后比较
         if pdf_base != pdf_value or excel_base != excel_value:
             diff_converted = abs(pdf_base - excel_base)
+            print(f"      [值比对] 换算后比较: pdf_base={pdf_base}, excel_base={excel_base}, diff={diff_converted:.4f}")
             if diff_converted <= self.tolerance:
+                print(f"      [值比对] 换算后匹配成功")
                 return True, pdf_base - excel_base
 
+        print(f"      [值比对] ❌ 匹配失败，最终diff=原始{diff_raw:.4f}, 换算后{abs(pdf_base - excel_base):.4f}")
         return False, pdf_value - excel_value
 
     def _highlight_context(
@@ -882,12 +955,21 @@ class Comparator:
         Returns:
             AnalysisResponse 完整的分析结果
         """
+        print(f"\n{'='*60}")
+        print(f"开始执行比对分析（预处理的PDF）")
+        print(f"指标总数: {len(indicators)}, PDF文件数: {len(pdf_names)}")
+        print(f"{'='*60}")
+
         results: list[IndicatorResult] = []
-        for indicator in indicators:
+        for idx, indicator in enumerate(indicators):
+            print(f"\n--- 进度 [{idx+1}/{len(indicators)}] {indicator.name} ---")
             result = self.compare_indicator(indicator, pdf_names, yearbook_index)
             results.append(result)
 
         progress = self._calc_progress(indicators)
+        print(f"\n{'='*60}")
+        print(f"比对分析完成！已核对: {progress.confirmed}, 未核对: {progress.unchecked}, 总计: {progress.total}")
+        print(f"{'='*60}")
 
         return AnalysisResponse(
             indicators=indicators,
@@ -913,14 +995,29 @@ class Comparator:
         Returns:
             AnalysisResponse 完整的分析结果
         """
+        print(f"\n{'='*60}")
+        print(f"开始执行完整比对分析")
+        print(f"PDF目录: {pdf_dir}")
+        print(f"{'='*60}")
+
         pdf_names = self.preprocess_pdfs(pdf_dir)
 
+        print(f"\n{'='*60}")
+        print(f"PDF预处理完成，共 {len(pdf_names)} 个文件")
+        print(f"指标总数: {len(indicators)}")
+        print(f"开始逐指标比对...")
+        print(f"{'='*60}")
+
         results: list[IndicatorResult] = []
-        for indicator in indicators:
+        for idx, indicator in enumerate(indicators):
+            print(f"\n--- 进度 [{idx+1}/{len(indicators)}] {indicator.name} ---")
             result = self.compare_indicator(indicator, pdf_names, yearbook_index)
             results.append(result)
 
         progress = self._calc_progress(indicators)
+        print(f"\n{'='*60}")
+        print(f"比对分析完成！已核对: {progress.confirmed}, 未核对: {progress.unchecked}, 总计: {progress.total}")
+        print(f"{'='*60}")
 
         return AnalysisResponse(
             indicators=indicators,

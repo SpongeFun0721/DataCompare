@@ -155,8 +155,8 @@ export default function IndicatorTable({ indicators, selectedId, onSelect, allRe
                       </div>
                     )}
                   </td>
-                  <td className="px-3 py-3 text-right font-mono text-sm text-slate-300">
-                    {ind.target_value.toLocaleString()}
+                  <td className="px-3 py-3 text-right font-mono text-sm text-slate-300 text-right">
+                    {ind.extracted_display || ind.target_value.toLocaleString()}
                   </td>
                   <td className="px-3 py-3 text-center">
                     <span className={`inline-flex items-center justify-center w-7 h-7 rounded-full text-sm ${status.bg}`}>

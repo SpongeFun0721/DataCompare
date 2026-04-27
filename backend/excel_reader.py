@@ -15,9 +15,140 @@ from pathlib import Path
 
 import pandas as pd
 
-from backend.models import Indicator
+from backend.models import Indicator, MultiSourceValue
 
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# 特殊字符和格式常量
+# ============================================================
+# 前缀修饰词：这些词出现在数字前面，提取时需要去掉但保留显示
+PREFIX_MODIFIERS = ["近", "近似", "超过", "约", "大约", "约莫", "近乎", "接近", "不低于", "不高于", "至少", "最多"]
+
+# 后缀修饰模式：数字后面跟着这些符号，提取数字但显示保留
+# 匹配如 "400+"、"600+"、">500"、"<300" 等
+SUFFIX_SYMBOL_PATTERN = re.compile(r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*([+>])')
+PREFIX_SYMBOL_PATTERN = re.compile(r'([<>])\s*(\d+(?:,\d{3})*(?:\.\d+)?)')
+
+# 多来源数值匹配模式：如 "年报:200 报告:300"、"2022年年报:200;2023年报告:300"
+# 匹配格式: [来源名][:：][数值]
+MULTI_SOURCE_PATTERN = re.compile(
+    r'([\u4e00-\u9fa5\d]+(?:年|月)?(?:年报|报告|来源|年鉴|url|URL)?)\s*[：:]\s*(\d+(?:,\d{3})*(?:\.\d+)?)'
+)
+
+
+def _extract_first_number(text: str) -> float | None:
+    """
+    从文本中提取第一个数字。
+    支持场景：
+    - "400+" → 400
+    - "近500" → 500
+    - "超过300" → 300
+    - "年报:200" → 200
+    - "1,234.56" → 1234.56
+    """
+    # 先去掉千分位逗号
+    cleaned = text.replace(",", "").replace("，", "")
+    
+    # 查找所有数字
+    nums = re.findall(r'(\d+(?:\.\d+)?)', cleaned)
+    if nums:
+        try:
+            return float(nums[0])
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_special_chars(raw_val: object) -> tuple[float | None, str, bool, list[MultiSourceValue]]:
+    """
+    解析包含特殊字符的单元格值。
+    
+    Returns:
+        (extracted_number, display_text, is_numeric, multi_source_values)
+        - extracted_number: 提取出的数字（用于比对），None 表示无法提取
+        - display_text: 前端显示的完整原始文本
+        - is_numeric: 是否包含可提取的数字
+        - multi_source_values: 多来源数值列表（如"年报:200 报告:300"）
+    """
+    display_text = str(raw_val).strip()
+    
+    # 特殊情况处理
+    if not display_text or display_text == "nan":
+        return None, display_text, False, []
+    
+    # ============================================================
+    # 1. 检查是否有多来源格式（如"年报:200 报告:300"）
+    #    多来源格式的特征是包含多个 ":数字" 或 "：数字" 模式
+    # ============================================================
+    multi_sources = []
+    multi_matches = MULTI_SOURCE_PATTERN.findall(display_text)
+    if len(multi_matches) >= 2:
+        # 确实是多来源格式
+        for source_hint, value_str in multi_matches:
+            try:
+                val = float(value_str.replace(",", ""))
+                multi_sources.append(MultiSourceValue(
+                    source_hint=source_hint.strip(),
+                    target_value=val,
+                    raw_text=f"{source_hint}:{value_str}",
+                ))
+            except ValueError:
+                continue
+        
+        if multi_sources:
+            # 返回第一个数值作为主比对值
+            first_val = multi_sources[0].target_value
+            return first_val, display_text, True, multi_sources
+    
+    # ============================================================
+    # 2. 检查前缀修饰词（"近"、"超过"、"约"等）
+    # ============================================================
+    for prefix in PREFIX_MODIFIERS:
+        if display_text.startswith(prefix) or prefix in display_text[:5]:
+            # 去掉前缀，提取数字
+            rest = display_text.replace(prefix, "", 1).strip()
+            num = _extract_first_number(rest)
+            if num is not None:
+                return num, display_text, True, multi_sources
+    
+    # ============================================================
+    # 3. 检查后缀符号（"+", ">" 等）
+    # ============================================================
+    suffix_match = SUFFIX_SYMBOL_PATTERN.search(display_text)
+    if suffix_match:
+        num_str = suffix_match.group(1).replace(",", "")
+        try:
+            return float(num_str), display_text, True, multi_sources
+        except ValueError:
+            pass
+    
+    # 前缀符号（">", "<" 等）
+    prefix_match = PREFIX_SYMBOL_PATTERN.search(display_text)
+    if prefix_match:
+        num_str = prefix_match.group(2).replace(",", "")
+        try:
+            return float(num_str), display_text, True, multi_sources
+        except ValueError:
+            pass
+    
+    # ============================================================
+    # 4. 尝试直接解析为数字
+    # ============================================================
+    try:
+        val = float(display_text.replace(",", "").replace("，", ""))
+        return val, display_text, True, multi_sources
+    except (ValueError, TypeError):
+        pass
+    
+    # ============================================================
+    # 5. 检查是否包含可识别数字
+    # ============================================================
+    num = _extract_first_number(display_text)
+    if num is not None:
+        return num, display_text, True, multi_sources
+    
+    return None, display_text, False, multi_sources
 
 # ============================================================
 # 列名映射（简单格式）
@@ -346,22 +477,25 @@ def _read_wide_format(df: pd.DataFrame) -> list[Indicator]:
             if pd.isna(raw_val):
                 continue
 
-            # 尝试解析数值
-            try:
-                target_value = float(raw_val)
-            except (ValueError, TypeError):
-                # 可能含有文本，尝试清理
-                cleaned = str(raw_val).replace(",", "").replace("，", "").strip()
-                try:
-                    target_value = float(cleaned)
-                except (ValueError, TypeError):
-                    logger.debug(f"跳过非数值: {raw_name} / {col_name} = {raw_val}")
-                    continue
+            # 使用 _parse_special_chars 解析所有格式
+            target_value, display_text, is_numeric, multi_sources = _parse_special_chars(raw_val)
+            
+            if target_value is None:
+                target_value = 0.0
+                is_numeric = False
+
+            # 提取 extracted_display：如果 display_text 包含特殊字符或与纯数值不同，则保留
+            extracted_display = display_text if (not is_numeric or display_text != str(target_value).replace(".0", "")) else None
+
+            # 只有多来源格式才设置 multi_source_values
+            ms_values = multi_sources if len(multi_sources) >= 2 else []
 
             indicators.append(Indicator(
                 id=len(indicators),
                 name=raw_name,
                 target_value=target_value,
+                display_value=display_text,
+                is_numeric=is_numeric,
                 year=f"{year_str}年",
                 category1=cat1,
                 category2=cat2,
@@ -369,7 +503,14 @@ def _read_wide_format(df: pd.DataFrame) -> list[Indicator]:
                 row_index=idx + 2,
                 col_name=col_name,
                 source_file=source_val,
+                extracted_display=extracted_display,
+                multi_source_values=ms_values,
             ))
+
+            if not is_numeric:
+                logger.debug(f"非数值文本，display: {raw_name} / {col_name} = {display_text}")
+            elif extracted_display:
+                logger.debug(f"含特殊字符文本，display: {raw_name} / {col_name} = {display_text}, extract={target_value}")
 
     logger.info(f"宽表格式: 解析 {len(indicators)} 个指标（{len(year_cols)} 个年份）")
     return indicators
