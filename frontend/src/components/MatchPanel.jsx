@@ -578,52 +578,161 @@ function PdfViewerWithPreload({
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [selection]);
 
-  // AI（URL）来源：一次性对所有 URL 发起请求并缓存
+  // AI（URL）来源：使用 SSE 流式逐个获取 URL 网页文本
   // urlCache: { url: { text, title } }
   const [urlCache, setUrlCache] = React.useState({});
   const [urlLoading, setUrlLoading] = React.useState(false);
+  // 流式进度：已完成数/总数/进度文本
+  const [urlProgress, setUrlProgress] = React.useState({ completed: 0, total: 0 });
+  // 30 秒无数据超时标记
+  const [streamTimeout, setStreamTimeout] = React.useState(false);
+  // 流式错误
+  const [streamError, setStreamError] = React.useState(null);
+  // 记录已经发起过 SSE 请求的 URL 集合，避免快速切换时重复请求
+  const requestedUrlSetsRef = React.useRef(new Set());
 
   React.useEffect(() => {
     if (!isUrlSource || urlSources.length === 0) return;
     let cancelled = false;
+    let timeoutId = null;
+    let lastDataTime = Date.now();
+    const abortController = new AbortController();
+    let reader = null;
 
-    // 找出尚未缓存的 URL
-    const uncachedUrls = urlSources
-      .map(sp => sp.url)
-      .filter(url => url && !urlCache[url]);
+    // 获取当前 URL 列表并生成唯一标识
+    const currentUrls = urlSources.map(sp => sp.url).filter(Boolean);
+    const urlSetKey = JSON.stringify([...currentUrls].sort());
 
-    if (uncachedUrls.length === 0) {
-      // 全部已缓存，直接使用缓存
+    // 1. 检查这个 URL 集合是否已经请求过且所有 URL 都已有缓存
+    const allCached = currentUrls.every(url => urlCache[url]);
+    if (requestedUrlSetsRef.current.has(urlSetKey) && allCached) {
       return;
     }
 
+    // 2. 找出尚未缓存的 URL
+    const uncachedUrls = currentUrls.filter(url => url && !urlCache[url]);
+    if (uncachedUrls.length === 0) {
+      // 所有 URL 都已缓存，标记为已请求过
+      requestedUrlSetsRef.current.add(urlSetKey);
+      return;
+    }
+
+    // 3. 标记为已请求过（防止后续重复请求）
+    requestedUrlSetsRef.current.add(urlSetKey);
+
+    // === 使用 SSE 流式获取 ===
     setUrlLoading(true);
+    setStreamTimeout(false);
+    setStreamError(null);
+    setUrlProgress({ completed: 0, total: uncachedUrls.length });
 
-    // 一次性批量请求所有未缓存的 URL
-    const params = new URLSearchParams();
-    uncachedUrls.forEach(url => params.append('urls', url));
-    fetch(`/api/proxy-urls?${params.toString()}`, { method: 'POST' })
-      .then(resp => {
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        return resp.json();
-      })
-      .then(data => {
-        if (cancelled) return;
-        const newCache = { ...urlCache };
-        (data.results || []).forEach(item => {
-          newCache[item.url] = { text: item.text || '', title: item.title || '' };
+    async function startStream() {
+      try {
+        const resp = await fetch('/api/analyze-stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls: uncachedUrls }),
+          signal: abortController.signal,  // 用于主动取消
         });
-        setUrlCache(newCache);
-        setUrlLoading(false);
-      })
-      .catch(err => {
-        if (cancelled) return;
-        console.error('批量获取 URL 失败:', err);
-        setUrlLoading(false);
-      });
 
-    return () => { cancelled = true; };
-  }, [isUrlSource, urlSources]); // 注意：不依赖 urlCache，避免循环
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+          throw new Error(err.detail || `HTTP ${resp.status}`);
+        }
+
+        reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        // 启动 30 秒超时检测（收到任何数据就重置）
+        timeoutId = setInterval(() => {
+          const elapsed = Date.now() - lastDataTime;
+          if (elapsed > 30000) {
+            if (!cancelled) {
+              setStreamTimeout(true);
+            }
+          }
+        }, 5000);
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          lastDataTime = Date.now();
+          // 重置超时状态（只要有数据到达）
+          if (streamTimeout) setStreamTimeout(false);
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // 保留未完成的行
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const jsonStr = line.slice(6);
+            let event;
+            try {
+              event = JSON.parse(jsonStr);
+            } catch {
+              continue; // 忽略解析失败的行
+            }
+
+            if (cancelled) return;
+
+            if (event.done) {
+              // 全部完成
+              setUrlProgress(prev => ({ ...prev, completed: event.total }));
+              setUrlLoading(false);
+              return;
+            }
+
+            // 单个 URL 结果
+            if (event.url) {
+              setUrlCache(prev => ({
+                ...prev,
+                [event.url]: {
+                  text: event.text || '',
+                  title: event.title || '',
+                  error: event.error || null,
+                },
+              }));
+              setUrlProgress(prev => ({
+                ...prev,
+                completed: (prev.completed || 0) + 1,
+              }));
+            }
+          }
+        }
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          // 主动取消，不视为错误
+          return;
+        }
+        if (!cancelled) {
+          console.error('SSE 流式获取 URL 失败:', err);
+          setStreamError(err.message);
+          setUrlLoading(false);
+        }
+      } finally {
+        if (timeoutId) clearInterval(timeoutId);
+        if (!cancelled) {
+          setUrlLoading(false);
+        }
+      }
+    }
+
+    startStream();
+
+    return () => {
+      cancelled = true;
+      if (timeoutId) clearInterval(timeoutId);
+      // 主动取消 fetch 请求 → 立即释放 TCP 连接
+      abortController.abort();
+      // 关闭 reader，停止读取流
+      if (reader && !reader.closed) {
+        reader.cancel().catch(() => {});
+      }
+    };
+  }, [isUrlSource, urlSources]);
 
   // ============================================================
   // AI 分析状态
@@ -737,6 +846,12 @@ function PdfViewerWithPreload({
         <div className="flex items-center justify-between px-4 py-2 bg-slate-800/80 border-b border-white/5 shadow-sm z-10 shrink-0">
           <div className="flex items-center gap-2">
             <span className="text-xs text-slate-400">🌐 网页文本</span>
+            {/* 流式下载进度 */}
+            {urlProgress.total > 0 && (
+              <span className="text-xs text-slate-500">
+                已完成 <span className="text-emerald-400 font-medium">{urlProgress.completed}</span>/{urlProgress.total}
+              </span>
+            )}
             {urlSources.length > 1 && (
               <select
                 value={selectedUrlIndex}
@@ -798,7 +913,28 @@ function PdfViewerWithPreload({
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                 </svg>
-                <span>正在加载网页内容...</span>
+                <span>
+                  正在加载网页内容...
+                  {urlProgress.total > 0 && (
+                    <span className="block text-center mt-2 text-sm">
+                      已完成 <span className="text-emerald-400 font-medium">{urlProgress.completed}</span>/{urlProgress.total}
+                    </span>
+                  )}
+                </span>
+                {/* 30秒超时提示 */}
+                {streamTimeout && (
+                  <div className="mt-6 px-4 py-3 bg-amber-500/10 border border-amber-500/30 rounded-lg text-center">
+                    <p className="text-amber-400 text-sm mb-1">⚠️ 数据加载超时</p>
+                    <p className="text-amber-500/70 text-xs">部分 URL 响应时间过长，已获取的数据可正常使用</p>
+                  </div>
+                )}
+                {/* 流式错误 */}
+                {streamError && (
+                  <div className="mt-6 px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-lg text-center">
+                    <p className="text-red-400 text-sm mb-1">❌ 加载异常</p>
+                    <p className="text-red-500/70 text-xs">{streamError}</p>
+                  </div>
+                )}
               </div>
             ) : webError ? (
               <div className="text-red-400 p-4 bg-red-500/10 rounded border border-red-500/20">

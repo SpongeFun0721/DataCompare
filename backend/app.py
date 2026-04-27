@@ -23,7 +23,7 @@ import fitz
 import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from urllib.parse import quote
 
@@ -640,24 +640,27 @@ from backend.request_controller import WebTextExtractor, RequestController, Rate
 # 全局 WebTextExtractor 实例（带域名限流配置）
 _web_extractor = WebTextExtractor(
     controller=RequestController(
-        max_concurrent=3,                    # 最多 3 个并发
-        default_rate=5.0,                    # 默认每秒 5 个请求
+        max_concurrent=2,                    # 降低并发，避免线程阻塞
+        default_rate=2.0,                    # 降低默认请求频率
         retry_max=2,                         # 最多重试 2 次
-        timeout=30.0,                        # 超时 30 秒
+        timeout=60.0,                        # 延长超时，防止超时重试风暴
+        max_concurrent_per_domain=2,         # 每个域名最多 2 个并发
         domain_configs={
-            # 针对体育类政府网站的限流配置
+            # 针对体育类政府网站的限流配置（所有域名均降低频率）
             "fencing.sport.org.cn": RateLimitConfig(
-                requests_per_second=2,       # 每秒最多 2 个请求
-                burst_size=3,                # 突发容量 3
-                min_interval=0.5,            # 最小间隔 0.5 秒
+                requests_per_second=1.5,     # 每秒最多 1.5 个请求
+                burst_size=2,                # 减少突发容量
+                min_interval=2.0,            # 增大最小间隔
             ),
             "www.sport.gov.cn": RateLimitConfig(
-                requests_per_second=3,
-                burst_size=5,
+                requests_per_second=1.5,
+                burst_size=2,
+                min_interval=2.0,
             ),
             "www.gov.cn": RateLimitConfig(
-                requests_per_second=3,
-                burst_size=5,
+                requests_per_second=1.5,
+                burst_size=2,
+                min_interval=2.0,
             ),
         },
     ),
@@ -674,6 +677,87 @@ async def proxy_urls(urls: list[str] = Query(...)):
     """
     results = await _web_extractor.extract_batch(urls)
     return {"results": results}
+
+
+@app.post("/api/analyze-stream")
+async def analyze_stream(body: dict):
+    """
+    SSE 流式分析：逐个处理 URL，每完成一个立即推送结果。
+
+    Request body: { "urls": ["url1", "url2", ...] }
+
+    SSE 事件格式：
+      data: {"url": "...", "text": "...", "title": "...", "index": 0, "total": 5}\n\n
+      data: {"url": "...", "error": "...", "index": 1, "total": 5}\n\n
+      data: {"done": true, "total": 5}\n\n
+
+    响应头：
+      Cache-Control: no-cache
+      X-Accel-Buffering: no
+    """
+    urls = body.get("urls", [])
+    if not urls:
+        raise HTTPException(400, "缺少 urls 参数")
+
+    logger.info(f"SSE 流式分析开始: {len(urls)} 个 URL")
+
+    async def event_generator():
+        total = len(urls)
+
+        async def process_one(url: str, idx: int):
+            """处理单个 URL，返回结果字典"""
+            try:
+                result = await _web_extractor.extract(url)
+                text = result.get("text", "")
+                if not text or text.startswith("获取失败"):
+                    return {
+                        "url": url,
+                        "error": text or "获取内容为空",
+                        "index": idx,
+                        "total": total,
+                        "status": "error",
+                    }
+                return {
+                    "url": url,
+                    "text": text,
+                    "title": result.get("title", ""),
+                    "index": idx,
+                    "total": total,
+                    "status": "success",
+                }
+            except Exception as e:
+                logger.error(f"URL 分析失败: {url[:80]}... - {e}")
+                return {
+                    "url": url,
+                    "error": str(e),
+                    "index": idx,
+                    "total": total,
+                    "status": "error",
+                }
+
+        # 创建所有 URL 处理任务
+        tasks = [process_one(url, i) for i, url in enumerate(urls)]
+
+        # 使用 as_completed：谁先完成就先推送谁
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                yield f"data: {json.dumps(result, ensure_ascii=False)}\n\n"
+            except Exception as e:
+                logger.error(f"SSE 推送异常: {e}")
+
+        # 全部完成 → 发送结束事件
+        logger.info(f"SSE 流式分析完成: {len(urls)} 个 URL")
+        yield f"data: {json.dumps({'done': True, 'total': total}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/proxy-url")

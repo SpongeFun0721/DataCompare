@@ -37,6 +37,7 @@ import asyncio
 import logging
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
@@ -53,17 +54,17 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RateLimitConfig:
     """域名级别的速率限制配置。"""
-    requests_per_second: float = 10.0       # 每秒允许的请求数
-    burst_size: int = 5                      # 突发请求的令牌桶容量
-    min_interval: float = 0.05               # 同一域名请求的最小间隔（秒）
+    requests_per_second: float = 0.5        # 每秒允许的请求数（极大降低频率防止被封/阻塞）
+    burst_size: int = 1                      # 突发请求的令牌桶容量（禁止突发，平稳请求）
+    min_interval: float = 5.0                # 同一域名请求的最小间隔（秒）（大幅增大间隔避免线程阻塞和访问拒绝）
 
 
 @dataclass
 class RetryConfig:
     """重试配置。"""
-    max_retries: int = 3                     # 最大重试次数
-    base_delay: float = 1.0                  # 初始退避延迟（秒）
-    max_delay: float = 30.0                  # 最大退避延迟（秒）
+    max_retries: int = 2                     # 最大重试次数（减少重试，避免激化阻塞）
+    base_delay: float = 6.0                  # 初始退避延迟（秒）（大幅增大避免过快重试）
+    max_delay: float = 120.0                 # 最大退避延迟（秒）（延长最大等待时间）
     jitter_factor: float = 0.5               # 随机抖动因子（0~1）
     retryable_statuses: tuple = (429, 500, 502, 503, 504)  # 可重试的 HTTP 状态码
 
@@ -280,10 +281,11 @@ class RequestController:
 
     def __init__(
         self,
-        max_concurrent: int = 10,
-        default_rate: float = 10.0,
-        retry_max: int = 3,
-        timeout: float = 30.0,
+        max_concurrent: int = 3,             # 全局最大并发数（降低避免线程阻塞）
+        default_rate: float = 2.0,           # 默认每秒请求数（降低请求频率）
+        retry_max: int = 3,                  # 最大重试次数
+        timeout: float = 60.0,               # 请求超时（秒）（延长超时防止超时重试风暴）
+        max_concurrent_per_domain: int = 2,  # 每个域名最大并发数（新增，防止单一域名阻塞全局）
         domain_configs: dict[str, RateLimitConfig] | None = None,
         client: httpx.AsyncClient | None = None,
     ):
@@ -293,6 +295,7 @@ class RequestController:
             default_rate: 默认每秒请求数（每个域名）
             retry_max: 最大重试次数
             timeout: 请求超时（秒）
+            max_concurrent_per_domain: 每个域名最大并发数（新增，防止单一域名阻塞全局）
             domain_configs: 域名特定的速率配置
             client: 可复用的 httpx.AsyncClient 实例
         """
@@ -304,9 +307,14 @@ class RequestController:
             domain_configs=domain_configs or {},
         )
         self.config = config
+        self._max_concurrent_per_domain = max_concurrent_per_domain
 
-        # 并发控制
+        # 全局并发控制
         self._semaphore = asyncio.Semaphore(config.max_concurrent)
+
+        # 域名级并发控制（每个域名独立的信号量，防止单一域名阻塞全局）
+        self._domain_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._domain_semaphores_lock = asyncio.Lock()
 
         # 域名限流
         self._rate_limiter = DomainRateLimiter(
@@ -320,6 +328,12 @@ class RequestController:
         # HTTP 客户端（可复用）
         self._client = client
 
+        # 线程池，将实际 HTTP 请求放到独立线程中执行，避免阻塞事件循环
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=max_concurrent * 2,
+            thread_name_prefix="http_worker",
+        )
+
         # 统计信息
         self._stats = {
             "total_requests": 0,
@@ -330,6 +344,15 @@ class RequestController:
             "total_wait_time": 0.0,
         }
         self._stats_lock = asyncio.Lock()
+
+    async def _get_domain_semaphore(self, domain: str) -> asyncio.Semaphore:
+        """获取或创建域名的信号量（懒加载）。"""
+        async with self._domain_semaphores_lock:
+            if domain not in self._domain_semaphores:
+                self._domain_semaphores[domain] = asyncio.Semaphore(
+                    self._max_concurrent_per_domain
+                )
+            return self._domain_semaphores[domain]
 
     def _get_domain(self, url: str) -> str:
         """从 URL 中提取域名。"""
@@ -364,6 +387,24 @@ class RequestController:
             logger.info(f"  成功率:       {success_rate:.1f}%")
         logger.info("=" * 50)
 
+    def _do_sync_request(
+        self,
+        method: str,
+        url: str,
+        timeout: float,
+        **kwargs,
+    ) -> httpx.Response:
+        """
+        在线程池中执行的同步 HTTP 请求。
+        将耗时 I/O 操作完全移出事件循环，避免阻塞 FastAPI 主线程。
+        """
+        # 每次请求使用独立客户端，避免连接池竞争
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+        ) as client:
+            return client.request(method, url, **kwargs)
+
     async def _make_request(
         self,
         method: str,
@@ -372,6 +413,7 @@ class RequestController:
     ) -> httpx.Response:
         """
         执行单个 HTTP 请求（包含限流、重试、降级）。
+        实际 HTTP I/O 在线程池中执行，完全不阻塞事件循环。
         
         Args:
             method: HTTP 方法（get, post 等）
@@ -391,60 +433,71 @@ class RequestController:
         await self._update_stats(total_requests=1)
 
         for attempt in range(self.config.retry.max_retries + 1):
-            # 1. 域名级别限流
-            wait_time = await self._rate_limiter.acquire(domain)
-            if wait_time > 0:
-                await self._update_stats(rate_limited=1, total_wait_time=wait_time)
-                logger.debug(f"[{domain}] 限流等待 {wait_time:.2f}s (尝试 {attempt + 1})")
+            # 如果不是第一次尝试，先执行重试退避等待（不占用信号量）
+            if attempt > 0:
+                delay = self._retry_handler.get_delay(attempt - 1)
+                await asyncio.sleep(delay)
 
-            # 2. 并发控制
-            async with self._semaphore:
-                try:
-                    # 3. 执行请求
-                    if self._client is not None:
-                        resp = await self._client.request(method, url, **kwargs)
-                    else:
-                        async with httpx.AsyncClient(
-                            timeout=self.config.default_timeout,
-                            follow_redirects=True,
-                        ) as client:
-                            resp = await client.request(method, url, **kwargs)
+            # ================================================================
+            # 1. 域名级并发控制 + 限流等待
+            #    - 限流等待在获取全局信号量之前执行
+            #    - 防止一个域名的慢请求阻塞全局信号量
+            # ================================================================
+            domain_sem = await self._get_domain_semaphore(domain)
+            async with domain_sem:
+                wait_time = await self._rate_limiter.acquire(domain)
+                if wait_time > 0:
+                    await self._update_stats(rate_limited=1, total_wait_time=wait_time)
+                    logger.debug(f"[{domain}] 限流等待 {wait_time:.2f}s (尝试 {attempt + 1})")
 
-                    # 4. 检查是否需要重试
-                    if self._retry_handler.should_retry(resp, None):
-                        await self._update_stats(retried=1)
-                        delay = self._retry_handler.get_delay(attempt)
-                        logger.warning(
-                            f"[{domain}] HTTP {resp.status_code} "
-                            f"重试 {attempt + 1}/{self.config.retry.max_retries} "
-                            f"等待 {delay:.1f}s: {url[:80]}"
+                # ================================================================
+                # 2. 全局并发控制：执行请求期间占用全局槽位
+                # ================================================================
+                async with self._semaphore:
+                    try:
+                        # 3. 通过线程池执行 HTTP 请求，完全避免阻塞事件循环
+                        loop = asyncio.get_running_loop()
+                        resp = await loop.run_in_executor(
+                            self._thread_pool,
+                            self._do_sync_request,
+                            method,
+                            url,
+                            self.config.default_timeout,
                         )
-                        await asyncio.sleep(delay)
-                        last_response = resp
-                        continue
 
-                    # 5. 成功
-                    await self._update_stats(successful=1)
-                    logger.debug(f"[{domain}] 成功 ({resp.status_code}): {url[:80]}")
-                    return resp
+                        # 4. 检查是否需要重试
+                        if self._retry_handler.should_retry(resp, None):
+                            await self._update_stats(retried=1)
+                            last_response = resp
+                            logger.warning(
+                                f"[{domain}] HTTP {resp.status_code} "
+                                f"将重试 {attempt + 1}/{self.config.retry.max_retries}: "
+                                f"{url[:80]}"
+                            )
+                            # 退出信号量上下文后执行退避等待
+                            continue
 
-                except Exception as e:
-                    last_exception = e
-                    if self._retry_handler.should_retry(None, e):
-                        await self._update_stats(retried=1)
-                        delay = self._retry_handler.get_delay(attempt)
-                        logger.warning(
-                            f"[{domain}] {type(e).__name__}: {e} "
-                            f"重试 {attempt + 1}/{self.config.retry.max_retries} "
-                            f"等待 {delay:.1f}s: {url[:80]}"
-                        )
-                        await asyncio.sleep(delay)
-                        continue
-                    else:
-                        # 不可重试的错误，直接抛出
-                        await self._update_stats(failed=1)
-                        logger.error(f"[{domain}] 不可重试的错误: {e}: {url[:80]}")
-                        raise
+                        # 5. 成功
+                        await self._update_stats(successful=1)
+                        logger.debug(f"[{domain}] 成功 ({resp.status_code}): {url[:80]}")
+                        return resp
+
+                    except Exception as e:
+                        last_exception = e
+                        if self._retry_handler.should_retry(None, e):
+                            await self._update_stats(retried=1)
+                            logger.warning(
+                                f"[{domain}] {type(e).__name__}: {e} "
+                                f"将重试 {attempt + 1}/{self.config.retry.max_retries}: "
+                                f"{url[:80]}"
+                            )
+                            # 退出信号量上下文后执行退避等待
+                            continue
+                        else:
+                            # 不可重试的错误，直接抛出
+                            await self._update_stats(failed=1)
+                            logger.error(f"[{domain}] 不可重试的错误: {e}: {url[:80]}")
+                            raise
 
         # 所有重试都失败
         await self._update_stats(failed=1)
@@ -588,10 +641,10 @@ class WebTextExtractor:
             max_chars: 非 HTML 内容最多提取的字符数
         """
         self.controller = controller or RequestController(
-            max_concurrent=3,
-            default_rate=5.0,
-            retry_max=2,
-            timeout=30.0,
+            max_concurrent=2,                # 降低并发，避免线程阻塞
+            default_rate=2.0,                # 降低请求频率
+            retry_max=2,                     # 最多重试 2 次
+            timeout=60.0,                    # 延长超时，防止超时重试风暴
         )
         self.max_lines = max_lines
         self.max_chars = max_chars
