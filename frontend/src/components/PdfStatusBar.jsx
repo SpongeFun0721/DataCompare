@@ -30,7 +30,8 @@ export default function PdfStatusBar({ indicator, matchInfo, onConfirm, onDisput
             };
             const sourceLabel = getSourceLabel(indicator);
             const yearShort = indicator.year ? indicator.year.replace('年', '') : '';
-            const displayText = sourceLabel ? `${yearShort}${sourceLabel}` : (indicator.year || '');
+            const pageSuffix = indicator.matched_page ? `P${indicator.matched_page}` : '';
+            const displayText = sourceLabel ? `${yearShort}${sourceLabel}${pageSuffix}` : (indicator.year || '');
 
             let badgeStyle = 'bg-purple-500/15 text-purple-400 border-purple-500/20';
             if (sourceLabel === '年鉴') {
@@ -116,7 +117,7 @@ export default function PdfStatusBar({ indicator, matchInfo, onConfirm, onDisput
           className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 transition-colors group relative"
           title="下一项 (↓)"
         >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7 7" /></svg>
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
           <span className="absolute -top-1 -right-1 text-[9px] bg-slate-700 text-slate-300 px-1 rounded leading-none opacity-0 group-hover:opacity-100 transition-opacity">↓</span>
         </button>
 

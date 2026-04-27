@@ -13,7 +13,6 @@ import {
   updateStatus as apiUpdateStatus,
   exportReport as apiExport,
   exportOriginalReport as apiExportOriginal,
-  exportText as apiExportText,
   saveManualBinding as apiSaveManualBinding,
 } from '../api';
 
@@ -41,6 +40,7 @@ export function useCompareData() {
   const [availableColors, setAvailableColors] = useState([]);
   const [selectedColors, setSelectedColors] = useState([]);
   const [colorMapping, setColorMapping] = useState({}); // { "#XXXXXX": "yearbook" | "report" | "url" }
+  const [matchedPdfs, setMatchedPdfs] = useState([]); // 后端匹配到的 PDF 列表
 
   // ---- 上传文件 ----
   const upload = useCallback(async (excelFile, pdfFiles) => {
@@ -91,6 +91,8 @@ export function useCompareData() {
         }
       }
       setColorMapping(defaultMapping);
+      // 保存后端匹配到的 PDF 列表
+      setMatchedPdfs(data.matched_pdfs || []);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -343,16 +345,6 @@ const selectIndicator = useCallback((id) => {
     }
   }, []);
 
-  // ---- 导出PDF提取纯文本 ----
-  const doExportText = useCallback(async () => {
-    setError(null);
-    try {
-      await apiExportText();
-    } catch (e) {
-      setError(e.message);
-    }
-  }, []);
-
   // ---- 切换选中颜色 ----
   const toggleColor = useCallback((color) => {
     setSelectedColors(prev =>
@@ -369,13 +361,13 @@ const selectIndicator = useCallback((id) => {
     progress,
     loading, analyzing, error,
     uploaded, analyzed,
-    availableColors, selectedColors, colorMapping,
+    availableColors, selectedColors, colorMapping, matchedPdfs,
     selectedPdf, targetPage, highlightText, triggerKey,
     // 方法
     upload, analyze,
     selectIndicator, selectNextIndicator, selectPrevIndicator, setReviewStatus, handleManualBind,
     setSelectedPdf, setTargetPage,
-    doExport, doExportOriginal, doExportText,
+    doExport, doExportOriginal,
     setError, toggleColor, setColorMapping,
   };
 }

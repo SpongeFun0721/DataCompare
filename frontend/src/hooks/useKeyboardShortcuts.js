@@ -8,7 +8,7 @@
  * - 1-4 切换年份筛选
  * - ? 弹出快捷键面板
  * - Ctrl+Z 撤销
- * - Ctrl+E 导出
+ * - Ctrl+E 导出标色原表
  * - 操作后自动跳下一个未核对指标
  */
 
@@ -24,7 +24,7 @@ const SHORTCUTS = [
   { key: '1-4',       desc: '1-4',  action: '切换年份筛选' },
   { key: '?',         desc: '?',    action: '显示/隐藏快捷键面板' },
   { key: 'Ctrl+Z',    desc: 'Ctrl+Z', action: '撤销上一步操作' },
-  { key: 'Ctrl+E',    desc: 'Ctrl+E', action: '导出报告' },
+  { key: 'Ctrl+E',    desc: 'Ctrl+E', action: '导出标色原表' },
 ];
 
 export function useKeyboardShortcuts({
@@ -199,7 +199,7 @@ export function useKeyboardShortcuts({
           case 'e':
             e.preventDefault();
             if (onExport) onExport();
-            showToast('正在导出报告...', 'info');
+            showToast('正在导出标色原表...', 'info');
             return;
         }
         return;

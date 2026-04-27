@@ -42,7 +42,7 @@ const SHORTCUTS_GROUPS = [
     title: '系统操作',
     items: [
       { keys: ['Ctrl', 'Z'], desc: '撤销上一步操作' },
-      { keys: ['Ctrl', 'E'], desc: '导出报告' },
+      { keys: ['Ctrl', 'E'], desc: '导出标色原表' },
       { keys: ['?'], desc: '显示/隐藏本面板' },
       { keys: ['Esc'], desc: '关闭本面板' },
     ],

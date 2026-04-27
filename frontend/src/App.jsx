@@ -28,12 +28,12 @@ function App() {
     progress,
     loading, analyzing, error,
     uploaded, analyzed,
-    availableColors, selectedColors, colorMapping,
+    availableColors, selectedColors, colorMapping, matchedPdfs,
     selectedPdf, targetPage, highlightText, triggerKey,
     upload, analyze,
     selectIndicator, selectNextIndicator, selectPrevIndicator, setReviewStatus, handleManualBind,
         setSelectedPdf, setTargetPage,
-    doExport, doExportOriginal, doExportText, setError, toggleColor, setColorMapping,
+    doExport, doExportOriginal, setError, toggleColor, setColorMapping,
   } = useCompareData();
 
     const excelInputRef = useRef(null);
@@ -86,7 +86,7 @@ function App() {
     },
     onYearFilter: handleYearFilter,
     currentYearFilter: yearFilter,
-    onExport: doExport,
+    onExport: doExportOriginal,
     onUndo: handleUndo,
     currentPage: pdfCurrentPage,
     numPages: pdfNumPages,
@@ -147,25 +147,29 @@ function App() {
             📊 {excelFile ? excelFile.name : '选择 Excel'}
           </button>
 
-          {/* PDF 选择 */}
-          <input
-            ref={pdfInputRef}
-            type="file"
-            accept=".pdf"
-            multiple
-            className="hidden"
-            onChange={e => setPdfFiles(Array.from(e.target.files || []))}
-          />
-          <button
-            onClick={() => pdfInputRef.current?.click()}
-            className={`px-3 py-1.5 text-xs rounded-lg border transition-all ${
-              pdfFiles.length > 0
-                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
-            }`}
-          >
-            📄 {pdfFiles.length > 0 ? `${pdfFiles.length} 个 PDF` : '选择 PDF'}
-          </button>
+          {/* PDF 选择 - 初始隐藏，只有上传后后端找不到对应 PDF 时才显示 */}
+          {(uploaded && matchedPdfs.length === 0) && (
+            <>
+              <input
+                ref={pdfInputRef}
+                type="file"
+                accept=".pdf"
+                multiple
+                className="hidden"
+                onChange={e => setPdfFiles(Array.from(e.target.files || []))}
+              />
+              <button
+                onClick={() => pdfInputRef.current?.click()}
+                className={`px-3 py-1.5 text-xs rounded-lg border transition-all ${
+                  pdfFiles.length > 0
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                    : 'bg-white/5 border-white/10 text-slate-300 hover:bg-white/10'
+                }`}
+              >
+                📄 {pdfFiles.length > 0 ? `${pdfFiles.length} 个 PDF` : '选择 PDF'}
+              </button>
+            </>
+          )}
 
           {/* 上传按钮 */}
           <button
@@ -357,7 +361,6 @@ function App() {
         analyzed={analyzed}
         onExport={doExport}
         onExportOriginal={doExportOriginal}
-        onExportText={doExportText}
       />
 
       {/* ====== 快捷键面板（? 打开） ====== */}

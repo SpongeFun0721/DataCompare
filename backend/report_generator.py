@@ -176,8 +176,12 @@ def _create_summary_sheet(wb: Workbook, results: list[IndicatorResult], pdf_name
     ws = wb.active
     ws.title = "汇总对照表"
 
-    # 表头：仅保留要求的列
-    headers = ["序号", "指标名称", "Excel目标值", "单位", "核对状态", "原数据来源"]
+    # 表头：年份、核对情况、一二三级标题、数据
+    headers = [
+        "序号", "年份", "一级标题", "二级标题", "三级标题（指标名称）",
+        "Excel目标值", "单位", "核对情况", "匹配值", "是否一致",
+        "匹配PDF", "匹配页码", "数据来源",
+    ]
 
     for col, h in enumerate(headers, 1):
         ws.cell(row=1, column=col, value=h)
@@ -186,17 +190,69 @@ def _create_summary_sheet(wb: Workbook, results: list[IndicatorResult], pdf_name
     # 数据行
     for row_idx, result in enumerate(results, 2):
         ind = result.indicator
-        ws.cell(row=row_idx, column=1, value=ind.id + 1)
-        ws.cell(row=row_idx, column=2, value=ind.name)
-        ws.cell(row=row_idx, column=3, value=ind.target_value)
-        ws.cell(row=row_idx, column=4, value=ind.unit or "")
 
+        # 序号
+        ws.cell(row=row_idx, column=1, value=ind.id + 1)
+
+        # 年份
+        ws.cell(row=row_idx, column=2, value=ind.year or "")
+
+        # 一级标题
+        ws.cell(row=row_idx, column=3, value=ind.category1 or "")
+
+        # 二级标题
+        ws.cell(row=row_idx, column=4, value=ind.category2 or "")
+
+        # 三级标题（指标名称）
+        ws.cell(row=row_idx, column=5, value=ind.name)
+
+        # Excel目标值
+        ws.cell(row=row_idx, column=6, value=ind.target_value)
+
+        # 单位
+        ws.cell(row=row_idx, column=7, value=ind.unit or "")
+
+        # 核对情况
         status_icon, status_fill = STATUS_MAP.get(ind.review_status, ("🔵", None))
-        status_cell = ws.cell(row=row_idx, column=5, value=f"{status_icon} {ind.review_status}")
+        status_cell = ws.cell(row=row_idx, column=8, value=f"{status_icon} {ind.review_status}")
         if status_fill:
             status_cell.fill = status_fill
 
-        ws.cell(row=row_idx, column=6, value=ind.source_file or "")
+        # 从 best_matches 中提取最佳匹配信息
+        best_match = None
+        best_confidence = -1
+        for pdf_name, match in result.best_matches.items():
+            if match and match.confidence > best_confidence:
+                best_match = match
+                best_confidence = match.confidence
+
+        # 匹配值
+        if best_match and best_match.matched_value is not None:
+            match_cell = ws.cell(row=row_idx, column=9, value=best_match.matched_value)
+        else:
+            match_cell = ws.cell(row=row_idx, column=9, value="未找到")
+
+        # 是否一致
+        if best_match:
+            is_match = best_match.is_match
+            consistent_cell = ws.cell(row=row_idx, column=10, value="✓ 一致" if is_match else "✗ 不一致")
+            if is_match:
+                consistent_cell.fill = MATCH_FILL
+            else:
+                consistent_cell.fill = DIFF_FILL
+                consistent_cell.font = DIFF_FONT
+        else:
+            consistent_cell = ws.cell(row=row_idx, column=10, value="未匹配")
+            consistent_cell.fill = NOT_FOUND_FILL
+
+        # 匹配PDF
+        ws.cell(row=row_idx, column=11, value=ind.matched_pdf_name or (best_match.pdf_name if best_match else ""))
+
+        # 匹配页码
+        ws.cell(row=row_idx, column=12, value=ind.matched_page or (best_match.page_number if best_match else ""))
+
+        # 数据来源（source_file）
+        ws.cell(row=row_idx, column=13, value=ind.source_file or "")
 
         # 行边框
         for col in range(1, len(headers) + 1):
