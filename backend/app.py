@@ -23,7 +23,7 @@ from pathlib import Path
 
 import fitz
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -38,7 +38,7 @@ from backend.comparator import Comparator
 from backend.report_generator import generate_report, generate_colored_original_excel
 from backend.ai_analyzer import AIAnalyzer
 from backend.request_controller import (
-    UserTaskManager, CachedWebTextExtractor, RateLimitConfig,
+    UserTaskManager, CachedWebTextExtractor, RateLimitConfig, DomainRateLimiter,
 )
 from backend.scheduler import RequestScheduler, Priority
 from cache.redis_cache import RedisCache
@@ -48,50 +48,36 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 全局状态（通过 lifespan 管理）
+# 辅助函数：从请求中获取用户 ID
 # ============================================================
-class AppState:
-    """应用全局状态，通过 lifespan 管理生命周期。"""
-    
-    def __init__(self):
-        self.redis_cache: RedisCache | None = None
-        self.task_manager: UserTaskManager | None = None
-        self.web_extractor: CachedWebTextExtractor | None = None
-        self.scheduler: RequestScheduler | None = None
-        self.ai_analyzer: AIAnalyzer | None = None
 
-
-# 全局状态实例
-_state = AppState()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def _get_user_id(request: Request, query_user_id: str | None = None) -> str:
     """
-    应用生命周期管理。
-    
-    启动时：
-    1. 连接 Redis
-    2. 创建 UserTaskManager
-    3. 创建 CachedWebTextExtractor
-    4. 启动 RequestScheduler
-    
-    关闭时：
-    1. 关闭 Redis 连接
-    2. 停止 RequestScheduler
+    从请求中获取用户 ID，优先级：
+    1. 请求头 X-User-Id
+    2. 查询参数 user_id
+    3. 自动生成 uuid4 前 8 位
     """
-    logger.info("🚀 应用启动中...")
+    # 1. 优先从请求头获取
+    header_user_id = request.headers.get("X-User-Id")
+    if header_user_id:
+        return header_user_id.strip()
     
-    # 1. 连接 Redis
-    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-    _state.redis_cache = await RedisCache.create(redis_url=redis_url)
-    if _state.redis_cache.is_redis_connected:
-        logger.info(f"✅ Redis 已连接: {redis_url}")
-    else:
-        logger.warning("⚠️ Redis 不可用，已降级到内存缓存")
+    # 2. 其次从查询参数获取
+    if query_user_id and query_user_id != "default":
+        return query_user_id.strip()
     
-    # 2. 创建 UserTaskManager（全局共享域名限流）
-    _state.task_manager = UserTaskManager(
+    # 3. 都没有则自动生成
+    return uuid.uuid4().hex[:8]
+
+
+def _create_user_task_manager() -> UserTaskManager:
+    """
+    创建独立的 UserTaskManager 实例。
+    每次 API 调用都应创建新实例，确保每个用户批次拥有独立的信号量。
+    全局域名限流器通过 DomainRateLimiter 共享（传入 _state.domain_rate_limiter）。
+    """
+    return UserTaskManager(
         default_rate=2.0,
         retry_max=2,
         request_timeout=20.0,
@@ -113,11 +99,84 @@ async def lifespan(app: FastAPI):
                 min_interval=2.0,
             ),
         },
+        # 传入全局共享的域名限流器，确保所有 UserTaskManager 实例共享同一个限流器
+        rate_limiter=_state.domain_rate_limiter,
+    )
+
+
+# ============================================================
+# 全局状态（通过 lifespan 管理）
+# ============================================================
+class AppState:
+    """应用全局状态，通过 lifespan 管理生命周期。"""
+    
+    def __init__(self):
+        self.redis_cache: RedisCache | None = None
+        self.domain_rate_limiter: DomainRateLimiter | None = None  # 全局共享域名限流器
+        self.web_extractor: CachedWebTextExtractor | None = None
+        self.scheduler: RequestScheduler | None = None
+        self.ai_analyzer: AIAnalyzer | None = None
+
+
+# 全局状态实例
+_state = AppState()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    应用生命周期管理。
+    
+    启动时：
+    1. 连接 Redis
+    2. 创建全局域名限流器（DomainRateLimiter，全局共享）
+    3. 创建 CachedWebTextExtractor
+    4. 启动 RequestScheduler
+    
+    关闭时：
+    1. 关闭 Redis 连接
+    2. 停止 RequestScheduler
+    """
+    logger.info("🚀 应用启动中...")
+    
+    # 1. 连接 Redis
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    _state.redis_cache = await RedisCache.create(redis_url=redis_url)
+    if _state.redis_cache.is_redis_connected:
+        logger.info(f"✅ Redis 已连接: {redis_url}")
+    else:
+        logger.warning("⚠️ Redis 不可用，已降级到内存缓存")
+    
+    # 2. 创建全局共享的域名限流器（保护目标服务器）
+    _state.domain_rate_limiter = DomainRateLimiter(
+        default_config=RateLimitConfig(
+            requests_per_second=2.0,
+            burst_size=1,
+            min_interval=5.0,
+        ),
+        domain_configs={
+            "fencing.sport.org.cn": RateLimitConfig(
+                requests_per_second=1.5,
+                burst_size=2,
+                min_interval=2.0,
+            ),
+            "www.sport.gov.cn": RateLimitConfig(
+                requests_per_second=1.5,
+                burst_size=2,
+                min_interval=2.0,
+            ),
+            "www.gov.cn": RateLimitConfig(
+                requests_per_second=1.5,
+                burst_size=2,
+                min_interval=2.0,
+            ),
+        },
     )
     
     # 3. 创建 CachedWebTextExtractor（集成 Redis 缓存）
+    # 注意：web_extractor 内部使用 UserTaskManager，每次 API 调用会创建独立的实例
     _state.web_extractor = CachedWebTextExtractor(
-        task_manager=_state.task_manager,
+        task_manager=None,  # 将在每次 API 调用时动态创建
         redis_cache=_state.redis_cache,
         max_lines=500,
         max_chars=50000,
@@ -200,23 +259,39 @@ def build_pdf_index():
     # --- 使用 glob 匹配年鉴 PDF（支持 年鉴2022.pdf、年鉴2023.pdf、中国体育年鉴.pdf 等变体）---
     yearbook_files = sorted(pdf_dir.glob("*年鉴*.pdf"))
     yearbook_index.clear()
+    print(f"\n=== DEBUG build_pdf_index ===")
+    print(f"  搜索目录: {pdf_dir}")
+    print(f"  glob(*年鉴*.pdf) 找到 {len(yearbook_files)} 个文件")
     if yearbook_files:
         for yb_path in yearbook_files:
             yb_name = yb_path.name
+            print(f"  发现年鉴文件: {repr(yb_name)}")
             # 从文件名中提取年份
             year_match = re.search(r'(\d{4})', yb_name)
             if year_match:
                 year_str = year_match.group(1)
                 yearbook_index[year_str] = yb_name
                 logger.info(f"年鉴 PDF 索引: 年份 {year_str} -> {yb_name}")
+                print(f"  ✅ 索引: yearbook_index['{year_str}'] = '{yb_name}'")
             else:
                 # 无年份的作为默认年鉴
                 yearbook_index["default"] = yb_name
                 logger.info(f"年鉴 PDF 索引(默认): {yb_name}")
+                print(f"  ⚠️ 无年份, 设为默认: yearbook_index['default'] = '{yb_name}'")
 
         logger.info(f"找到 {len(yearbook_files)} 个年鉴 PDF: {list(yearbook_index.keys())}")
+        print(f"  最终 yearbook_index: {yearbook_index}")
     else:
         logger.warning("未找到年鉴 PDF (glob: *年鉴*.pdf)")
+        print(f"  ❌ 未找到年鉴 PDF!")
+        # 列出目录下所有 PDF 文件，检查文件名编码
+        all_files = list(pdf_dir.glob("*.pdf"))
+        print(f"  目录下共有 {len(all_files)} 个 PDF 文件:")
+        for f in all_files[:10]:
+            print(f"    - {repr(f.name)}")
+        if len(all_files) > 10:
+            print(f"    ... (共 {len(all_files)} 个)")
+    print(f"=== DEBUG END ===\n")
 
     # --- 加载 map.json ---
     map_path = DATA_DIR / "map.json"
@@ -242,20 +317,46 @@ _semaphore = asyncio.Semaphore(3)
 task_status: dict[str, str] = {}  # task_id -> status
 
 # ============================================================
-# 应用数据（单用户简化版，生产环境应使用数据库）
+# 应用数据（按 user_id 隔离）
+# 每个用户拥有独立的数据字典，避免多用户互相覆盖
 # ============================================================
-_app_data: dict = {
-    "analysis": None,       # AnalysisResponse
-    "comparator": None,     # Comparator 实例
-    "excel_path": None,     # 上传的 Excel 文件路径
-    "pdf_dir": None,        # PDF 文件目录
-}
+_app_data: dict[str, dict] = {}  # key=user_id, value=用户数据字典
+
+
+def _get_user_data(user_id: str) -> dict:
+    """
+    获取指定用户的独立数据字典。
+    如果用户不存在，自动创建新的空字典。
+    
+    每个用户的数据结构：
+    {
+        "analysis": AnalysisResponse | None,   # 分析结果
+        "comparator": Comparator | None,       # Comparator 实例
+        "excel_path": Path | None,             # 上传的 Excel 文件路径
+        "pdf_dir": Path | None,                # PDF 文件目录
+        "indicators": list | None,             # 解析后的指标列表
+        "task_id": str | None,                 # 当前任务 ID
+        "matched_pdfs": list | None,           # 匹配到的 PDF 文件名列表
+    }
+    """
+    if user_id not in _app_data:
+        _app_data[user_id] = {
+            "analysis": None,
+            "comparator": None,
+            "excel_path": None,
+            "pdf_dir": None,
+            "indicators": None,
+            "task_id": None,
+            "matched_pdfs": None,
+        }
+    return _app_data[user_id]
 
 
 @app.post("/api/upload")
 async def upload_files(
+    request: Request,
     excel: UploadFile = File(...),
-    user_id: str = "default",
+    user_id: str = Query("default", description="用户 ID，用于多用户隔离"),
 ):
     """
     上传 Excel 文件（去掉了 PDF 上传参数）。
@@ -263,11 +364,14 @@ async def upload_files(
     用户上传 Excel 后，系统自动进行 PDF 匹配并进入分析流程。
     使用 user_id + task_id 创建独立工作目录。
     """
+    # 动态获取用户 ID
+    actual_user_id = _get_user_id(request, user_id)
+    
     task_id = str(uuid.uuid4())
     task_status[task_id] = "uploading"
 
     # 用户隔离：创建独立目录 uploads/{user_id}/{task_id}/
-    work_dir = UPLOAD_DIR / user_id / task_id
+    work_dir = UPLOAD_DIR / actual_user_id / task_id
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # 保存 Excel
@@ -276,14 +380,16 @@ async def upload_files(
         content = await excel.read()
         f.write(content)
 
-    _app_data["excel_path"] = excel_path
-    _app_data["analysis"] = None
-    _app_data["comparator"] = None
+    # 获取该用户的独立数据字典
+    user_data = _get_user_data(actual_user_id)
+    user_data["excel_path"] = excel_path
+    user_data["analysis"] = None
+    user_data["comparator"] = None
 
     # 解析 Excel
     try:
         indicators = read_indicators(excel_path)
-        _app_data["indicators"] = indicators
+        user_data["indicators"] = indicators
 
         unique_colors = list(set([ind.bg_color for ind in indicators if ind.bg_color]))
         if "无填充" in unique_colors:
@@ -325,19 +431,20 @@ async def upload_files(
     task_status[task_id] = "uploaded"
 
     logger.info(
-        f"上传并解析完成: Excel={excel.filename}, "
+        f"[用户={actual_user_id}] 上传并解析完成: Excel={excel.filename}, "
         f"共 {len(indicators)} 个指标, "
         f"收集到 {len(matched_pdfs)} 个 PDF, "
         f"{url_count} 个 URL 来源, "
         f"颜色={unique_colors}"
     )
 
-    _app_data["task_id"] = task_id
-    _app_data["matched_pdfs"] = list(matched_pdfs)
+    user_data["task_id"] = task_id
+    user_data["matched_pdfs"] = list(matched_pdfs)
 
     return {
         "message": "上传并解析成功",
         "task_id": task_id,
+        "user_id": actual_user_id,
         "excel": excel.filename,
         "matched_pdfs": list(matched_pdfs),
         "url_count": url_count,
@@ -411,10 +518,19 @@ def _find_in_year_group(pdf_core_name: str, year_group: list[str]) -> str | None
 
 
 @app.post("/api/analyze", response_model=AnalysisResponse)
-async def run_analysis(req: AnalyzeRequest):
+async def run_analysis(
+    request: Request,
+    req: AnalyzeRequest,
+):
     """触发比对分析，返回完整结果。"""
-    pdf_dir = _app_data.get("pdf_dir")
-    indicators = _app_data.get("indicators")
+    # 动态获取用户 ID
+    actual_user_id = _get_user_id(request)
+    
+    # 获取该用户的独立数据字典
+    user_data = _get_user_data(actual_user_id)
+    
+    pdf_dir = user_data.get("pdf_dir")
+    indicators = user_data.get("indicators")
 
     if indicators is None:
         raise HTTPException(400, "请先上传文件")
@@ -448,7 +564,7 @@ async def run_analysis(req: AnalyzeRequest):
         # 如果映射为空或未知类型，则不设置任何字段（后续会被标记为未核对）
 
     # 获取上传时匹配到的 PDF 文件名列表，仅预处理这些需要的 PDF
-    matched_pdfs = _app_data.get("matched_pdfs", [])
+    matched_pdfs = user_data.get("matched_pdfs", [])
 
     # ============================================================
     # DEBUG: 打印第一个指标的 best_matches 内容
@@ -483,40 +599,36 @@ async def run_analysis(req: AnalyzeRequest):
 
     async with _semaphore:
         comparator = Comparator()
-        _app_data["comparator"] = comparator
+        user_data["comparator"] = comparator
 
         try:
             # 仅预处理匹配到的 PDF 文件
             pdf_files = [pdf_dir / name for name in matched_pdfs if (pdf_dir / name).exists()]
-            # print(f"  实际存在的 PDF 文件: {[p.name for p in pdf_files]}")
             if not pdf_files:
-                # print(f"  ⚠️ 所有 matched_pdfs 都不存在！回退到 run_full_analysis")
                 # 回退：预处理目录下所有 PDF
                 analysis = comparator.run_full_analysis(filtered_indicators, pdf_dir, yearbook_index)
             else:
                 for pdf_path in pdf_files:
-                    # print(f"  预处理: {pdf_path.name}")
                     comparator.preprocess_pdf(pdf_path)
                 pdf_names = [p.name for p in pdf_files]
-                # print(f"  预处理完成，pdf_names: {pdf_names}")
-                # print(f"  缓存中的 key: {list(comparator._cache.keys())}")
                 analysis = comparator.run_analysis_on_preprocessed(filtered_indicators, pdf_names, yearbook_index)
         except Exception as e:
             logger.exception("分析失败")
             raise HTTPException(500, f"分析失败: {e}")
 
-
-    _app_data["analysis"] = analysis
-    logger.info(f"分析完成: {len(filtered_indicators)} 个指标, {len(analysis.pdf_names)} 个 PDF")
+    user_data["analysis"] = analysis
+    logger.info(f"[用户={actual_user_id}] 分析完成: {len(filtered_indicators)} 个指标, {len(analysis.pdf_names)} 个 PDF")
 
     return analysis
 
 
 
 @app.get("/api/debug/analysis")
-async def debug_analysis():
+async def debug_analysis(request: Request):
     """调试接口：返回分析数据的详细信息。"""
-    analysis: AnalysisResponse | None = _app_data.get("analysis")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    analysis: AnalysisResponse | None = user_data.get("analysis")
     if analysis is None:
         return {"error": "请先执行分析"}
     
@@ -555,9 +667,11 @@ async def debug_analysis():
 
 
 @app.get("/api/indicators")
-async def get_indicators():
+async def get_indicators(request: Request):
     """获取指标列表。"""
-    analysis: AnalysisResponse | None = _app_data.get("analysis")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    analysis: AnalysisResponse | None = user_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -568,9 +682,11 @@ async def get_indicators():
 
 
 @app.get("/api/indicator/{indicator_id}/matches")
-async def get_indicator_matches(indicator_id: int):
+async def get_indicator_matches(indicator_id: int, request: Request):
     """获取某个指标在所有 PDF 中的匹配详情。"""
-    analysis: AnalysisResponse | None = _app_data.get("analysis")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    analysis: AnalysisResponse | None = user_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -582,9 +698,11 @@ async def get_indicator_matches(indicator_id: int):
 
 
 @app.put("/api/indicator/{indicator_id}/status")
-async def update_indicator_status(indicator_id: int, body: StatusUpdate):
+async def update_indicator_status(indicator_id: int, body: StatusUpdate, request: Request):
     """更新指标的核对状态。"""
-    analysis: AnalysisResponse | None = _app_data.get("analysis")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    analysis: AnalysisResponse | None = user_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -593,16 +711,18 @@ async def update_indicator_status(indicator_id: int, body: StatusUpdate):
             result.indicator.review_status = body.status
             result.indicator.note = body.note
             analysis.progress = _calc_progress(analysis)
-            logger.info(f"指标 [{result.indicator.name}] 状态更新为: {body.status}")
+            logger.info(f"[用户={actual_user_id}] 指标 [{result.indicator.name}] 状态更新为: {body.status}")
             return {"message": "更新成功", "progress": analysis.progress}
 
     raise HTTPException(404, f"未找到 ID 为 {indicator_id} 的指标")
 
 
 @app.get("/api/progress")
-async def get_progress():
+async def get_progress(request: Request):
     """获取核对进度统计。"""
-    analysis: AnalysisResponse | None = _app_data.get("analysis")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    analysis: AnalysisResponse | None = user_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -611,10 +731,12 @@ async def get_progress():
 
 
 @app.get("/api/export")
-async def export_report():
+async def export_report(request: Request):
     """导出核对结果 Excel 文件。"""
-    analysis: AnalysisResponse | None = _app_data.get("analysis")
-    excel_path = _app_data.get("excel_path")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    analysis: AnalysisResponse | None = user_data.get("analysis")
+    excel_path = user_data.get("excel_path")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -642,10 +764,12 @@ async def export_report():
 
 
 @app.get("/api/export_original")
-async def export_original():
+async def export_original(request: Request):
     """下载标色的原版 Excel 报告"""
-    excel_path = _app_data.get("excel_path")
-    analysis = _app_data.get("analysis")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    excel_path = user_data.get("excel_path")
+    analysis = user_data.get("analysis")
 
     if not excel_path or not analysis:
         raise HTTPException(400, "暂无分析结果可导出标色原表")
@@ -661,7 +785,6 @@ async def export_original():
         encoded_filename = quote(report_path.name)
         return FileResponse(
             path=str(report_path),
-            filename=report_path.name,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
                 "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
@@ -673,9 +796,11 @@ async def export_original():
 
 
 @app.get("/api/export_text")
-async def export_text():
+async def export_text(request: Request):
     """下载 PDF 提取出的纯文本（用于诊断OCR和提取质量）"""
-    comparator = _app_data.get("comparator")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    comparator = user_data.get("comparator")
     if not comparator or not comparator._cache:
         raise HTTPException(400, "请先执行开始分析，以便系统提取 PDF 纯文本")
 
@@ -687,7 +812,7 @@ async def export_text():
             text_content += full_text
             text_content += "\n\n"
 
-        excel_path = _app_data.get("excel_path")
+        excel_path = user_data.get("excel_path")
         text_filename = f"PDF纯文本_{excel_path.stem}.txt" if excel_path else "PDF提取纯文本.txt"
         output_path = OUTPUT_DIR / text_filename
         output_path.write_text(text_content, encoding="utf-8")
@@ -695,7 +820,6 @@ async def export_text():
         encoded_filename = quote(output_path.name)
         return FileResponse(
             path=str(output_path),
-            filename=output_path.name,
             media_type="text/plain",
             headers={
                 "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
@@ -707,7 +831,7 @@ async def export_text():
 
 
 @app.get("/api/pdf/{filename}")
-async def serve_pdf(filename: str):
+async def serve_pdf(filename: str, request: Request):
     """提供 PDF 文件的 HTTP 访问，供前端 PDF 阅读器加载。"""
     # 优先从 SHARED_PDF_DIR 查找
     pdf_path = SHARED_PDF_DIR / filename
@@ -716,8 +840,10 @@ async def serve_pdf(filename: str):
         from backend.config import UPLOAD_DIR
         pdf_path = UPLOAD_DIR / "pdfs" / filename
     if not pdf_path.exists():
-        # 再回退到 _app_data 中的 pdf_dir
-        pdf_dir = _app_data.get("pdf_dir")
+        # 再回退到该用户的 pdf_dir
+        actual_user_id = _get_user_id(request)
+        user_data = _get_user_data(actual_user_id)
+        pdf_dir = user_data.get("pdf_dir")
         if pdf_dir:
             pdf_path = pdf_dir / filename
 
@@ -746,6 +872,7 @@ async def serve_pdf(filename: str):
 
 @app.post("/api/proxy-urls")
 async def proxy_urls(
+    request: Request,
     urls: list[str] = Query(...),
     user_id: str = Query("default", description="用户 ID，用于多用户隔离"),
 ):
@@ -753,12 +880,20 @@ async def proxy_urls(
     批量代理获取多个 URL 的内容，通过 CachedWebTextExtractor 限流获取并缓存。
     返回 JSON：{ "results": [{ "url": ..., "text": ..., "title": ... }, ...] }
     """
-    results = await _state.web_extractor.extract_batch(urls, user_id=user_id)
+    actual_user_id = _get_user_id(request, user_id)
+    
+    # 每次 API 调用创建独立的 UserTaskManager 实例（独立信号量）
+    # 全局域名限流器保持共享
+    task_manager = _create_user_task_manager()
+    results = await _state.web_extractor.extract_batch(urls, user_id=actual_user_id, task_manager=task_manager)
     return {"results": results}
 
 
 @app.post("/api/analyze-stream")
-async def analyze_stream(body: dict):
+async def analyze_stream(
+    request: Request,
+    body: dict,
+):
     """
     SSE 流式分析：逐个处理 URL，每完成一个立即推送结果。
 
@@ -774,11 +909,13 @@ async def analyze_stream(body: dict):
       X-Accel-Buffering: no
     """
     urls = body.get("urls", [])
-    user_id = body.get("user_id", "default")
+    query_user_id = body.get("user_id", "default")
+    actual_user_id = _get_user_id(request, query_user_id)
+    
     if not urls:
         raise HTTPException(400, "缺少 urls 参数")
 
-    logger.info(f"SSE 流式分析开始: {len(urls)} 个 URL, 用户={user_id}")
+    logger.info(f"SSE 流式分析开始: {len(urls)} 个 URL, 用户={actual_user_id}")
 
     async def event_generator():
         total = len(urls)
@@ -786,7 +923,9 @@ async def analyze_stream(body: dict):
         async def process_one(url: str, idx: int):
             """处理单个 URL，返回结果字典"""
             try:
-                result = await _state.web_extractor.extract(url, user_id=user_id)
+                # 每次 API 调用创建独立的 UserTaskManager 实例
+                task_manager = _create_user_task_manager()
+                result = await _state.web_extractor.extract(url, user_id=actual_user_id, task_manager=task_manager)
                 text = result.get("text", "")
                 if not text or text.startswith("获取失败"):
                     return {
@@ -842,6 +981,7 @@ async def analyze_stream(body: dict):
 
 @app.get("/api/proxy-url")
 async def proxy_url(
+    request: Request,
     url: str = Query(..., description="要代理获取的 URL"),
     user_id: str = Query("default", description="用户 ID，用于多用户隔离"),
 ):
@@ -850,7 +990,11 @@ async def proxy_url(
     通过 CachedWebTextExtractor 限流获取并缓存。
     返回 JSON：{ "url": ..., "text": ..., "title": ... }
     """
-    result = await _state.web_extractor.extract(url, user_id=user_id)
+    actual_user_id = _get_user_id(request, user_id)
+    
+    # 每次 API 调用创建独立的 UserTaskManager 实例（独立信号量）
+    task_manager = _create_user_task_manager()
+    result = await _state.web_extractor.extract(url, user_id=actual_user_id, task_manager=task_manager)
     return result
 
 
@@ -917,9 +1061,11 @@ async def get_task_status(task_id: str):
 
 
 @app.post("/api/manual_bind")
-async def manual_bind(body: ManualBinding):
+async def manual_bind(body: ManualBinding, request: Request):
     """处理用户在 PDF 上的手动绑定"""
-    analysis: AnalysisResponse | None = _app_data.get("analysis")
+    actual_user_id = _get_user_id(request)
+    user_data = _get_user_data(actual_user_id)
+    analysis: AnalysisResponse | None = user_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -965,14 +1111,100 @@ def _calc_progress(analysis: AnalysisResponse) -> ProgressInfo:
 
 
 # ============================================================
-# 8. AI 分析接口 —— 使用 DeepSeek API 分析 URL 网页文本
+# 8. 刷新网页缓存接口
+# ============================================================
+
+@app.post("/api/refresh-cache")
+async def refresh_cache(
+    request: Request,
+    body: dict,
+):
+    """
+    主动刷新指定 URL 的网页缓存。
+    
+    处理流程：
+    1. 删除 Redis 中该 URL 的缓存
+    2. 清除 WebTextExtractor 的内存缓存
+    3. 重新抓取最新内容
+    4. 返回新内容
+    
+    请求体：
+    {
+        "url": "https://..."
+    }
+    
+    返回：
+    {
+        "success": true,
+        "url": "...",
+        "title": "...",
+        "text_preview": "前200字...",
+        "cached": false
+    }
+    """
+    url = body.get("url", "")
+    if not url:
+        raise HTTPException(400, "缺少 url 参数")
+
+    logger.info(f"刷新缓存: {url[:80]}...")
+
+    # 1. 删除 Redis 缓存
+    cache_key = f"web_cache:{url}"
+    if _state.redis_cache is not None:
+        try:
+            await _state.redis_cache.delete(cache_key)
+            logger.info(f"Redis 缓存已删除: {cache_key}")
+        except Exception as e:
+            logger.warning(f"Redis 删除缓存失败: {e}")
+
+    # 2. 清除内存缓存
+    if _state.web_extractor is not None:
+        try:
+            _state.web_extractor._memory_cache.pop(url, None)
+            logger.info(f"内存缓存已清除: {url[:60]}...")
+        except Exception as e:
+            logger.warning(f"内存缓存清除失败: {e}")
+
+    # 3. 重新抓取最新内容
+    try:
+        actual_user_id = _get_user_id(request, "refresh")
+        task_manager = _create_user_task_manager()
+        result = await _state.web_extractor.extract(url, user_id=actual_user_id, task_manager=task_manager)
+        
+        text = result.get("text", "")
+        title = result.get("title", "")
+        text_preview = text[:200] if text else ""
+        
+        logger.info(f"缓存刷新成功: {url[:60]}... (text_len={len(text)})")
+        
+        return {
+            "success": True,
+            "url": url,
+            "title": title,
+            "text_preview": text_preview,
+            "cached": False,
+        }
+    except Exception as e:
+        logger.exception(f"缓存刷新失败: {url}")
+        return {
+            "success": False,
+            "url": url,
+            "error": str(e),
+        }
+
+
+# ============================================================
+# 9. AI 分析接口 —— 使用 DeepSeek API 分析 URL 网页文本
 # ============================================================
 # 全局 AIAnalyzer 实例
 _ai_analyzer = AIAnalyzer()
 
 
 @app.post("/api/ai-analyze")
-async def ai_analyze(body: dict):
+async def ai_analyze(
+    request: Request,
+    body: dict,
+):
     """
     使用 DeepSeek AI 分析 URL 网页文本中是否存在指标数据。
 
@@ -1017,10 +1249,14 @@ async def ai_analyze(body: dict):
     if not url:
         raise HTTPException(400, "缺少 url")
 
-    # 1. 获取 URL 网页文本
-    user_id = body.get("user_id", "default")
-    logger.info(f"AI 分析: 获取 URL 网页文本: {url[:80]}..., 用户={user_id}")
-    web_result = await _state.web_extractor.extract(url, user_id=user_id)
+    # 动态获取用户 ID
+    query_user_id = body.get("user_id", "default")
+    actual_user_id = _get_user_id(request, query_user_id)
+
+    # 1. 获取 URL 网页文本（使用独立的 UserTaskManager）
+    logger.info(f"AI 分析: 获取 URL 网页文本: {url[:80]}..., 用户={actual_user_id}")
+    task_manager = _create_user_task_manager()
+    web_result = await _state.web_extractor.extract(url, user_id=actual_user_id, task_manager=task_manager)
     web_text = web_result.get("text", "")
 
     if not web_text or web_text.startswith("获取失败"):

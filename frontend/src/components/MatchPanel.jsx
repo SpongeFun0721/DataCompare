@@ -3,7 +3,7 @@ import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import PdfStatusBar from './PdfStatusBar';
-import { getPdfUrl } from '../api';
+import { getPdfUrl, refreshCache as apiRefreshCache } from '../api';
 
 // 确保 worker 已配置（PdfViewer 中已配置，这里复用）
 pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
@@ -776,6 +776,52 @@ function PdfViewerWithPreload({
     }
   }, [indicator, urlSource]);
 
+  // ============================================================
+  // 刷新缓存状态
+  // ============================================================
+  const [refreshingUrl, setRefreshingUrl] = React.useState(null); // 正在刷新的 URL
+  const [refreshCooldown, setRefreshCooldown] = React.useState({}); // { url: timestamp }
+  const [refreshToast, setRefreshToast] = React.useState(null); // { message, type }
+
+  // 刷新缓存
+  const handleRefreshCache = React.useCallback(async (url) => {
+    // 3 秒冷却限制
+    const lastRefresh = refreshCooldown[url];
+    if (lastRefresh && Date.now() - lastRefresh < 3000) {
+      setRefreshToast({ message: '请 3 秒后再试', type: 'warning' });
+      setTimeout(() => setRefreshToast(null), 2000);
+      return;
+    }
+
+    setRefreshingUrl(url);
+    setRefreshToast(null);
+    try {
+      const result = await apiRefreshCache(url);
+      if (result.success) {
+        // 更新缓存数据
+        setUrlCache(prev => ({
+          ...prev,
+          [url]: {
+            text: result.text_preview ? `（已刷新，预览前200字）\n${result.text_preview}` : '（已刷新，内容为空）',
+            title: result.title || '',
+            error: null,
+          },
+        }));
+        setRefreshCooldown(prev => ({ ...prev, [url]: Date.now() }));
+        setRefreshToast({ message: '✅ 缓存已刷新', type: 'success' });
+        setTimeout(() => setRefreshToast(null), 2000);
+      } else {
+        setRefreshToast({ message: `❌ 刷新失败: ${result.error}`, type: 'error' });
+        setTimeout(() => setRefreshToast(null), 3000);
+      }
+    } catch (err) {
+      setRefreshToast({ message: `❌ 刷新失败: ${err.message}`, type: 'error' });
+      setTimeout(() => setRefreshToast(null), 3000);
+    } finally {
+      setRefreshingUrl(null);
+    }
+  }, [refreshCooldown]);
+
   // 从缓存中获取当前 URL 的数据
   const cachedData = React.useMemo(() => {
     if (!urlSource?.url) return null;
@@ -868,6 +914,40 @@ function PdfViewerWithPreload({
             {webTitle && <span className="text-xs text-slate-500 truncate max-w-[200px]">{webTitle}</span>}
           </div>
           <div className="flex items-center gap-2">
+            {/* 缓存状态标签 */}
+            {cachedData && !refreshingUrl && (
+              <span className="text-xs text-emerald-400/70 flex items-center gap-1">
+                ✅ 缓存
+              </span>
+            )}
+            {refreshingUrl === urlSource?.url && (
+              <span className="text-xs text-amber-400/70 flex items-center gap-1">
+                🔄 已刷新
+              </span>
+            )}
+            {/* 刷新缓存按钮 */}
+            <button
+              onClick={() => handleRefreshCache(urlSource?.url)}
+              disabled={refreshingUrl === urlSource?.url || !urlSource?.url}
+              className={`px-2 py-1 text-xs rounded border transition-colors flex items-center gap-1 ${
+                refreshingUrl === urlSource?.url
+                  ? 'bg-amber-500/10 text-amber-400/50 border-amber-500/20 cursor-not-allowed'
+                  : 'bg-white/5 text-slate-400 border-white/10 hover:bg-white/10 hover:text-slate-200'
+              }`}
+              title="清除缓存并重新抓取网页内容"
+            >
+              {refreshingUrl === urlSource?.url ? (
+                <>
+                  <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  刷新中...
+                </>
+              ) : (
+                <>🔄 刷新缓存</>
+              )}
+            </button>
             {/* AI 分析按钮 */}
             <button
               onClick={runAiAnalysis}

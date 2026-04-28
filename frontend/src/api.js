@@ -8,12 +8,24 @@
 const BASE = '/api';
 
 /**
- * 通用请求函数
+ * 从 localStorage 获取当前用户 ID
+ */
+function getUserId() {
+  return localStorage.getItem('current_user_id') || '';
+}
+
+/**
+ * 通用请求函数（自动携带 X-User-Id）
  */
 async function request(url, options = {}) {
+  const userId = getUserId();
   const res = await fetch(`${BASE}${url}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-User-Id': userId,
+      ...options.headers,
+    },
   });
 
   if (!res.ok) {
@@ -52,7 +64,14 @@ export async function uploadFiles(excelFile, pdfFiles) {
     throw new Error(body.detail || '上传失败');
   }
 
-  return res.json();
+  const data = await res.json();
+
+  // 保存后端返回的 user_id 到 localStorage，供后续请求使用
+  if (data && data.user_id) {
+    localStorage.setItem('current_user_id', data.user_id);
+  }
+
+  return data;
 }
 
 /**
@@ -110,7 +129,10 @@ export async function getProgress() {
  */
 export async function exportReport() {
   try {
-    const res = await fetch(`${BASE}/export`, { method: 'GET' });
+    const res = await fetch(`${BASE}/export`, {
+      method: 'GET',
+      headers: { 'X-User-Id': getUserId() },
+    });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || '导出报告失败');
@@ -141,7 +163,10 @@ export async function exportReport() {
  */
 export async function exportOriginalReport() {
   try {
-    const res = await fetch(`${BASE}/export_original`, { method: 'GET' });
+    const res = await fetch(`${BASE}/export_original`, {
+      method: 'GET',
+      headers: { 'X-User-Id': getUserId() },
+    });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || '导出标色原表失败');
@@ -172,7 +197,10 @@ export async function exportOriginalReport() {
  */
 export async function exportText() {
   try {
-    const res = await fetch(`${BASE}/export_text`, { method: 'GET' });
+    const res = await fetch(`${BASE}/export_text`, {
+      method: 'GET',
+      headers: { 'X-User-Id': getUserId() },
+    });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || '导出纯文本失败');
@@ -244,5 +272,18 @@ export async function aiAnalyze(params) {
   return request('/ai-analyze', {
     method: 'POST',
     body: JSON.stringify(params),
+  });
+}
+
+/**
+ * 刷新指定 URL 的网页缓存
+ * 删除 Redis + 内存缓存，重新抓取最新内容
+ * @param {string} url - 要刷新缓存的 URL
+ * @returns {Promise<Object>} { success, url, title, text_preview, cached }
+ */
+export async function refreshCache(url) {
+  return request('/refresh-cache', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
   });
 }

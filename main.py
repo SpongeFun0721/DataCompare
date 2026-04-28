@@ -1,5 +1,5 @@
 def main():
-    print("Hello from datacompare!")
+    # print("Hello from datacompare!")
 
 
 if __name__ == "__main__":

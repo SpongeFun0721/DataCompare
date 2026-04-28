@@ -11,6 +11,8 @@ data/
 backend/data
 backend/uploads
 Redis/
+dump.rdb
 # Virtual environments
 .venv
 .pdf_cache
+

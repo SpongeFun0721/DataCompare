@@ -46,6 +46,15 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# 默认请求头
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+}
+
 
 # ============================================================
 # 1. 配置类
@@ -402,6 +411,7 @@ class RequestController:
         with httpx.Client(
             timeout=timeout,
             follow_redirects=True,
+            headers=DEFAULT_HEADERS,
         ) as client:
             return client.request(method, url, **kwargs)
 
@@ -877,6 +887,7 @@ class UserTaskManager:
         request_timeout: float = 20.0,
         max_concurrent_per_domain: int = 2,
         domain_configs: dict[str, RateLimitConfig] | None = None,
+        rate_limiter: DomainRateLimiter | None = None,
     ):
         """
         Args:
@@ -885,12 +896,18 @@ class UserTaskManager:
             request_timeout: 单个 HTTP 请求超时（秒）
             max_concurrent_per_domain: 每个域名最大并发数
             domain_configs: 域名特定的速率配置
+            rate_limiter: 外部传入的 DomainRateLimiter 实例（全局共享）。
+                         传入后 default_rate 和 domain_configs 参数将被忽略。
         """
         # 全局共享的域名限流器（保护目标服务器）
-        self._rate_limiter = DomainRateLimiter(
-            default_config=RateLimitConfig(requests_per_second=default_rate),
-            domain_configs=domain_configs or {},
-        )
+        # 优先使用外部传入的实例，确保全局共享
+        if rate_limiter is not None:
+            self._rate_limiter = rate_limiter
+        else:
+            self._rate_limiter = DomainRateLimiter(
+                default_config=RateLimitConfig(requests_per_second=default_rate),
+                domain_configs=domain_configs or {},
+            )
 
         # 全局共享的重试处理器
         self._retry_handler = RetryHandler(RetryConfig(max_retries=retry_max))
@@ -945,6 +962,7 @@ class UserTaskManager:
         with httpx.Client(
             timeout=timeout,
             follow_redirects=True,
+            headers=DEFAULT_HEADERS,
         ) as client:
             return client.request(method, url)
 
@@ -1295,6 +1313,7 @@ class CachedWebTextExtractor:
         self,
         url: str,
         user_id: str = "default",
+        task_manager: UserTaskManager | None = None,
     ) -> dict:
         """
         提取单个 URL 的网页文本（带 Redis 缓存）。
@@ -1304,6 +1323,7 @@ class CachedWebTextExtractor:
         Args:
             url: 目标 URL
             user_id: 用户 ID（用于统计）
+            task_manager: 自定义 UserTaskManager 实例，不传则使用 self.task_manager
         
         Returns:
             {"url": ..., "title": ..., "text": ..., "cached": bool}
@@ -1336,12 +1356,16 @@ class CachedWebTextExtractor:
         # ============================================================
         # 3. 网络请求
         # ============================================================
+        # 使用传入的 task_manager，或回退到 self.task_manager
+        tm = task_manager or self.task_manager
+        if tm is None:
+            tm = UserTaskManager()
         try:
-            batch_result = await self.task_manager.run_batch(
+            batch_result = await tm.run_batch(
                 user_id=user_id,
                 urls=[url],
                 max_concurrent=1,
-                batch_timeout=self.task_manager._request_timeout + 10,
+                batch_timeout=tm._request_timeout + 10,
             )
 
             if batch_result.completed > 0 and batch_result.results[0] is not None:
@@ -1389,6 +1413,7 @@ class CachedWebTextExtractor:
         user_id: str = "default",
         max_concurrent: int = 3,
         batch_timeout: float = 30.0,
+        task_manager: UserTaskManager | None = None,
     ) -> list[dict]:
         """
         批量提取多个 URL 的网页文本。
@@ -1400,6 +1425,7 @@ class CachedWebTextExtractor:
             user_id: 用户 ID
             max_concurrent: 该用户批次的最大并发数
             batch_timeout: 批次整体超时（秒）
+            task_manager: 自定义 UserTaskManager 实例，不传则使用 self.task_manager
         
         Returns:
             [{"url": ..., "title": ..., "text": ..., "cached": bool}, ...]
@@ -1437,8 +1463,12 @@ class CachedWebTextExtractor:
                 uncached_urls.append(url)
 
         # 未缓存的通过 UserTaskManager 批量获取
+        # 使用传入的 task_manager，或回退到 self.task_manager
+        tm = task_manager or self.task_manager
+        if tm is None:
+            tm = UserTaskManager()
         if uncached_urls:
-            batch_result = await self.task_manager.run_batch(
+            batch_result = await tm.run_batch(
                 user_id=user_id,
                 urls=uncached_urls,
                 max_concurrent=max_concurrent,

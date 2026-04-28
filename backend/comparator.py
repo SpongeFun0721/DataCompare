@@ -414,15 +414,24 @@ class Comparator:
         #   - url: 只处理 URL
         # 三个字段互斥，由 /api/analyze 根据 color_mapping 设置
         # ============================================================
+        print(f"\n>>> DEBUG compare_indicator 来源字段检查:")
+        print(f"    source_file_yearbook = {repr(indicator.source_file_yearbook)}")
+        print(f"    source_file_report   = {repr(indicator.source_file_report)}")
+        print(f"    source_file_url      = {repr(indicator.source_file_url)}")
+        print(f"    bg_color             = {repr(indicator.bg_color)}")
+        print(f"    yearbook_index       = {yearbook_index}")
         if indicator.source_file_yearbook:
             source_type = "yearbook"
             source_text = indicator.source_file_yearbook
+            print(f"    ✅ 使用 yearbook 来源")
         elif indicator.source_file_report:
             source_type = "report"
             source_text = indicator.source_file_report
+            print(f"    ✅ 使用 report 来源")
         elif indicator.source_file_url:
             source_type = "url"
             source_text = indicator.source_file_url
+            print(f"    ✅ 使用 url 来源")
         else:
             # 无来源 → 未核对（无法自动判断，留待用户核对）
             print(f"    ⚠️ [{indicator.name}] 无任何来源字段，标记为未核对")
