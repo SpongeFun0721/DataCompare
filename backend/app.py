@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import fitz
@@ -35,11 +37,116 @@ from backend.excel_reader import read_indicators
 from backend.comparator import Comparator
 from backend.report_generator import generate_report, generate_colored_original_excel
 from backend.ai_analyzer import AIAnalyzer
+from backend.request_controller import (
+    UserTaskManager, CachedWebTextExtractor, RateLimitConfig,
+)
+from backend.scheduler import RequestScheduler, Priority
+from cache.redis_cache import RedisCache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="数据比对工具", version="1.0.0")
+
+# ============================================================
+# 全局状态（通过 lifespan 管理）
+# ============================================================
+class AppState:
+    """应用全局状态，通过 lifespan 管理生命周期。"""
+    
+    def __init__(self):
+        self.redis_cache: RedisCache | None = None
+        self.task_manager: UserTaskManager | None = None
+        self.web_extractor: CachedWebTextExtractor | None = None
+        self.scheduler: RequestScheduler | None = None
+        self.ai_analyzer: AIAnalyzer | None = None
+
+
+# 全局状态实例
+_state = AppState()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    应用生命周期管理。
+    
+    启动时：
+    1. 连接 Redis
+    2. 创建 UserTaskManager
+    3. 创建 CachedWebTextExtractor
+    4. 启动 RequestScheduler
+    
+    关闭时：
+    1. 关闭 Redis 连接
+    2. 停止 RequestScheduler
+    """
+    logger.info("🚀 应用启动中...")
+    
+    # 1. 连接 Redis
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    _state.redis_cache = await RedisCache.create(redis_url=redis_url)
+    if _state.redis_cache.is_redis_connected:
+        logger.info(f"✅ Redis 已连接: {redis_url}")
+    else:
+        logger.warning("⚠️ Redis 不可用，已降级到内存缓存")
+    
+    # 2. 创建 UserTaskManager（全局共享域名限流）
+    _state.task_manager = UserTaskManager(
+        default_rate=2.0,
+        retry_max=2,
+        request_timeout=20.0,
+        max_concurrent_per_domain=2,
+        domain_configs={
+            "fencing.sport.org.cn": RateLimitConfig(
+                requests_per_second=1.5,
+                burst_size=2,
+                min_interval=2.0,
+            ),
+            "www.sport.gov.cn": RateLimitConfig(
+                requests_per_second=1.5,
+                burst_size=2,
+                min_interval=2.0,
+            ),
+            "www.gov.cn": RateLimitConfig(
+                requests_per_second=1.5,
+                burst_size=2,
+                min_interval=2.0,
+            ),
+        },
+    )
+    
+    # 3. 创建 CachedWebTextExtractor（集成 Redis 缓存）
+    _state.web_extractor = CachedWebTextExtractor(
+        task_manager=_state.task_manager,
+        redis_cache=_state.redis_cache,
+        max_lines=500,
+        max_chars=50000,
+    )
+    
+    # 4. 启动 RequestScheduler
+    _state.scheduler = RequestScheduler()
+    await _state.scheduler.start()
+    
+    # 5. 创建 AIAnalyzer
+    _state.ai_analyzer = AIAnalyzer()
+    
+    logger.info("✅ 应用启动完成")
+    
+    yield  # 应用运行中
+    
+    # 关闭时清理
+    logger.info("🛑 应用关闭中...")
+    
+    if _state.scheduler is not None:
+        await _state.scheduler.stop()
+    
+    if _state.redis_cache is not None:
+        await _state.redis_cache.close()
+    
+    logger.info("✅ 应用已关闭")
+
+
+app = FastAPI(title="数据比对工具", version="1.0.0", lifespan=lifespan)
 
 # CORS 配置，允许前端开发服务器访问
 app.add_middleware(
@@ -135,9 +242,9 @@ _semaphore = asyncio.Semaphore(3)
 task_status: dict[str, str] = {}  # task_id -> status
 
 # ============================================================
-# 全局状态（单用户简化版，生产环境应使用数据库）
+# 应用数据（单用户简化版，生产环境应使用数据库）
 # ============================================================
-_state: dict = {
+_app_data: dict = {
     "analysis": None,       # AnalysisResponse
     "comparator": None,     # Comparator 实例
     "excel_path": None,     # 上传的 Excel 文件路径
@@ -169,14 +276,14 @@ async def upload_files(
         content = await excel.read()
         f.write(content)
 
-    _state["excel_path"] = excel_path
-    _state["analysis"] = None
-    _state["comparator"] = None
+    _app_data["excel_path"] = excel_path
+    _app_data["analysis"] = None
+    _app_data["comparator"] = None
 
     # 解析 Excel
     try:
         indicators = read_indicators(excel_path)
-        _state["indicators"] = indicators
+        _app_data["indicators"] = indicators
 
         unique_colors = list(set([ind.bg_color for ind in indicators if ind.bg_color]))
         if "无填充" in unique_colors:
@@ -225,8 +332,8 @@ async def upload_files(
         f"颜色={unique_colors}"
     )
 
-    _state["task_id"] = task_id
-    _state["matched_pdfs"] = list(matched_pdfs)
+    _app_data["task_id"] = task_id
+    _app_data["matched_pdfs"] = list(matched_pdfs)
 
     return {
         "message": "上传并解析成功",
@@ -306,8 +413,8 @@ def _find_in_year_group(pdf_core_name: str, year_group: list[str]) -> str | None
 @app.post("/api/analyze", response_model=AnalysisResponse)
 async def run_analysis(req: AnalyzeRequest):
     """触发比对分析，返回完整结果。"""
-    pdf_dir = _state.get("pdf_dir")
-    indicators = _state.get("indicators")
+    pdf_dir = _app_data.get("pdf_dir")
+    indicators = _app_data.get("indicators")
 
     if indicators is None:
         raise HTTPException(400, "请先上传文件")
@@ -341,7 +448,7 @@ async def run_analysis(req: AnalyzeRequest):
         # 如果映射为空或未知类型，则不设置任何字段（后续会被标记为未核对）
 
     # 获取上传时匹配到的 PDF 文件名列表，仅预处理这些需要的 PDF
-    matched_pdfs = _state.get("matched_pdfs", [])
+    matched_pdfs = _app_data.get("matched_pdfs", [])
 
     # ============================================================
     # DEBUG: 打印第一个指标的 best_matches 内容
@@ -376,7 +483,7 @@ async def run_analysis(req: AnalyzeRequest):
 
     async with _semaphore:
         comparator = Comparator()
-        _state["comparator"] = comparator
+        _app_data["comparator"] = comparator
 
         try:
             # 仅预处理匹配到的 PDF 文件
@@ -399,7 +506,7 @@ async def run_analysis(req: AnalyzeRequest):
             raise HTTPException(500, f"分析失败: {e}")
 
 
-    _state["analysis"] = analysis
+    _app_data["analysis"] = analysis
     logger.info(f"分析完成: {len(filtered_indicators)} 个指标, {len(analysis.pdf_names)} 个 PDF")
 
     return analysis
@@ -409,7 +516,7 @@ async def run_analysis(req: AnalyzeRequest):
 @app.get("/api/debug/analysis")
 async def debug_analysis():
     """调试接口：返回分析数据的详细信息。"""
-    analysis: AnalysisResponse | None = _state.get("analysis")
+    analysis: AnalysisResponse | None = _app_data.get("analysis")
     if analysis is None:
         return {"error": "请先执行分析"}
     
@@ -450,7 +557,7 @@ async def debug_analysis():
 @app.get("/api/indicators")
 async def get_indicators():
     """获取指标列表。"""
-    analysis: AnalysisResponse | None = _state.get("analysis")
+    analysis: AnalysisResponse | None = _app_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -463,7 +570,7 @@ async def get_indicators():
 @app.get("/api/indicator/{indicator_id}/matches")
 async def get_indicator_matches(indicator_id: int):
     """获取某个指标在所有 PDF 中的匹配详情。"""
-    analysis: AnalysisResponse | None = _state.get("analysis")
+    analysis: AnalysisResponse | None = _app_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -477,7 +584,7 @@ async def get_indicator_matches(indicator_id: int):
 @app.put("/api/indicator/{indicator_id}/status")
 async def update_indicator_status(indicator_id: int, body: StatusUpdate):
     """更新指标的核对状态。"""
-    analysis: AnalysisResponse | None = _state.get("analysis")
+    analysis: AnalysisResponse | None = _app_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -495,7 +602,7 @@ async def update_indicator_status(indicator_id: int, body: StatusUpdate):
 @app.get("/api/progress")
 async def get_progress():
     """获取核对进度统计。"""
-    analysis: AnalysisResponse | None = _state.get("analysis")
+    analysis: AnalysisResponse | None = _app_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -506,8 +613,8 @@ async def get_progress():
 @app.get("/api/export")
 async def export_report():
     """导出核对结果 Excel 文件。"""
-    analysis: AnalysisResponse | None = _state.get("analysis")
-    excel_path = _state.get("excel_path")
+    analysis: AnalysisResponse | None = _app_data.get("analysis")
+    excel_path = _app_data.get("excel_path")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -537,8 +644,8 @@ async def export_report():
 @app.get("/api/export_original")
 async def export_original():
     """下载标色的原版 Excel 报告"""
-    excel_path = _state.get("excel_path")
-    analysis = _state.get("analysis")
+    excel_path = _app_data.get("excel_path")
+    analysis = _app_data.get("analysis")
 
     if not excel_path or not analysis:
         raise HTTPException(400, "暂无分析结果可导出标色原表")
@@ -568,7 +675,7 @@ async def export_original():
 @app.get("/api/export_text")
 async def export_text():
     """下载 PDF 提取出的纯文本（用于诊断OCR和提取质量）"""
-    comparator = _state.get("comparator")
+    comparator = _app_data.get("comparator")
     if not comparator or not comparator._cache:
         raise HTTPException(400, "请先执行开始分析，以便系统提取 PDF 纯文本")
 
@@ -580,7 +687,7 @@ async def export_text():
             text_content += full_text
             text_content += "\n\n"
 
-        excel_path = _state.get("excel_path")
+        excel_path = _app_data.get("excel_path")
         text_filename = f"PDF纯文本_{excel_path.stem}.txt" if excel_path else "PDF提取纯文本.txt"
         output_path = OUTPUT_DIR / text_filename
         output_path.write_text(text_content, encoding="utf-8")
@@ -609,8 +716,8 @@ async def serve_pdf(filename: str):
         from backend.config import UPLOAD_DIR
         pdf_path = UPLOAD_DIR / "pdfs" / filename
     if not pdf_path.exists():
-        # 再回退到 _state 中的 pdf_dir
-        pdf_dir = _state.get("pdf_dir")
+        # 再回退到 _app_data 中的 pdf_dir
+        pdf_dir = _app_data.get("pdf_dir")
         if pdf_dir:
             pdf_path = pdf_dir / filename
 
@@ -633,49 +740,20 @@ async def serve_pdf(filename: str):
 
 # ============================================================
 # 7. URL 代理接口（用于 AI 来源的网页文本提取）
-#     使用 RequestController + WebTextExtractor 进行限流控制
+#     使用 CachedWebTextExtractor（集成 Redis 缓存 + 用户级隔离）
 # ============================================================
-from backend.request_controller import WebTextExtractor, RequestController, RateLimitConfig
-
-# 全局 WebTextExtractor 实例（带域名限流配置）
-_web_extractor = WebTextExtractor(
-    controller=RequestController(
-        max_concurrent=2,                    # 降低并发，避免线程阻塞
-        default_rate=2.0,                    # 降低默认请求频率
-        retry_max=2,                         # 最多重试 2 次
-        timeout=60.0,                        # 延长超时，防止超时重试风暴
-        max_concurrent_per_domain=2,         # 每个域名最多 2 个并发
-        domain_configs={
-            # 针对体育类政府网站的限流配置（所有域名均降低频率）
-            "fencing.sport.org.cn": RateLimitConfig(
-                requests_per_second=1.5,     # 每秒最多 1.5 个请求
-                burst_size=2,                # 减少突发容量
-                min_interval=2.0,            # 增大最小间隔
-            ),
-            "www.sport.gov.cn": RateLimitConfig(
-                requests_per_second=1.5,
-                burst_size=2,
-                min_interval=2.0,
-            ),
-            "www.gov.cn": RateLimitConfig(
-                requests_per_second=1.5,
-                burst_size=2,
-                min_interval=2.0,
-            ),
-        },
-    ),
-    max_lines=500,
-    max_chars=50000,
-)
 
 
 @app.post("/api/proxy-urls")
-async def proxy_urls(urls: list[str] = Query(...)):
+async def proxy_urls(
+    urls: list[str] = Query(...),
+    user_id: str = Query("default", description="用户 ID，用于多用户隔离"),
+):
     """
-    批量代理获取多个 URL 的内容，通过 WebTextExtractor 限流获取并缓存。
+    批量代理获取多个 URL 的内容，通过 CachedWebTextExtractor 限流获取并缓存。
     返回 JSON：{ "results": [{ "url": ..., "text": ..., "title": ... }, ...] }
     """
-    results = await _web_extractor.extract_batch(urls)
+    results = await _state.web_extractor.extract_batch(urls, user_id=user_id)
     return {"results": results}
 
 
@@ -684,7 +762,7 @@ async def analyze_stream(body: dict):
     """
     SSE 流式分析：逐个处理 URL，每完成一个立即推送结果。
 
-    Request body: { "urls": ["url1", "url2", ...] }
+    Request body: { "urls": ["url1", "url2", ...], "user_id": "..." }
 
     SSE 事件格式：
       data: {"url": "...", "text": "...", "title": "...", "index": 0, "total": 5}\n\n
@@ -696,10 +774,11 @@ async def analyze_stream(body: dict):
       X-Accel-Buffering: no
     """
     urls = body.get("urls", [])
+    user_id = body.get("user_id", "default")
     if not urls:
         raise HTTPException(400, "缺少 urls 参数")
 
-    logger.info(f"SSE 流式分析开始: {len(urls)} 个 URL")
+    logger.info(f"SSE 流式分析开始: {len(urls)} 个 URL, 用户={user_id}")
 
     async def event_generator():
         total = len(urls)
@@ -707,7 +786,7 @@ async def analyze_stream(body: dict):
         async def process_one(url: str, idx: int):
             """处理单个 URL，返回结果字典"""
             try:
-                result = await _web_extractor.extract(url)
+                result = await _state.web_extractor.extract(url, user_id=user_id)
                 text = result.get("text", "")
                 if not text or text.startswith("获取失败"):
                     return {
@@ -735,8 +814,9 @@ async def analyze_stream(body: dict):
                     "status": "error",
                 }
 
-        # 创建所有 URL 处理任务
-        tasks = [process_one(url, i) for i, url in enumerate(urls)]
+        # 创建所有 URL 处理任务（使用 asyncio.create_task 创建 Task 对象）
+        coros = [process_one(url, i) for i, url in enumerate(urls)]
+        tasks = [asyncio.create_task(coro) for coro in coros]
 
         # 使用 as_completed：谁先完成就先推送谁
         for coro in asyncio.as_completed(tasks):
@@ -761,13 +841,16 @@ async def analyze_stream(body: dict):
 
 
 @app.get("/api/proxy-url")
-async def proxy_url(url: str = Query(..., description="要代理获取的 URL")):
+async def proxy_url(
+    url: str = Query(..., description="要代理获取的 URL"),
+    user_id: str = Query("default", description="用户 ID，用于多用户隔离"),
+):
     """
     代理获取指定 URL 的内容，提取网页正文纯文本。
-    通过 WebTextExtractor 限流获取并缓存。
+    通过 CachedWebTextExtractor 限流获取并缓存。
     返回 JSON：{ "url": ..., "text": ..., "title": ... }
     """
-    result = await _web_extractor.extract(url)
+    result = await _state.web_extractor.extract(url, user_id=user_id)
     return result
 
 
@@ -836,7 +919,7 @@ async def get_task_status(task_id: str):
 @app.post("/api/manual_bind")
 async def manual_bind(body: ManualBinding):
     """处理用户在 PDF 上的手动绑定"""
-    analysis: AnalysisResponse | None = _state.get("analysis")
+    analysis: AnalysisResponse | None = _app_data.get("analysis")
     if analysis is None:
         raise HTTPException(400, "请先执行分析")
 
@@ -935,8 +1018,9 @@ async def ai_analyze(body: dict):
         raise HTTPException(400, "缺少 url")
 
     # 1. 获取 URL 网页文本
-    logger.info(f"AI 分析: 获取 URL 网页文本: {url[:80]}...")
-    web_result = await _web_extractor.extract(url)
+    user_id = body.get("user_id", "default")
+    logger.info(f"AI 分析: 获取 URL 网页文本: {url[:80]}..., 用户={user_id}")
+    web_result = await _state.web_extractor.extract(url, user_id=user_id)
     web_text = web_result.get("text", "")
 
     if not web_text or web_text.startswith("获取失败"):

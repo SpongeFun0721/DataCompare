@@ -18,6 +18,7 @@ dependencies = [
     "pymupdf>=1.27.2.3",
     "httpx>=0.28.1",
     "bs4>=0.0.2",
+    "redis>=7.4.0",
 ]
 
 [[tool.uv.index]]

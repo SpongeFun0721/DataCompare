@@ -1,8 +1,40 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 
 export default function PdfStatusBar({ indicator, matchInfo, onConfirm, onDispute, onPrev, onNext, onSaveComment }) {
   const [commentText, setCommentText] = useState('');
   const [showCommentInput, setShowCommentInput] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const prevIndicatorIdRef = useRef(indicator?.id);
+  const showCommentInputRef = useRef(false);
+  const commentTextRef = useRef('');
+  const onSaveCommentRef = useRef(onSaveComment);
+
+  // 同步 ref 与 state，确保 useEffect 能拿到最新值
+  showCommentInputRef.current = showCommentInput;
+  commentTextRef.current = commentText;
+  onSaveCommentRef.current = onSaveComment;
+
+  // ---- 自动保存批注 & 重置状态 ----
+  // 当 indicator 变化时（用户切换到另一个数据项）：
+  // 1. 如果批注输入框打开且有未保存内容，自动保存到上一个指标
+  // 2. 重置批注状态（清空输入框、关闭面板）
+  useEffect(() => {
+    const prevId = prevIndicatorIdRef.current;
+    prevIndicatorIdRef.current = indicator?.id;
+
+    // indicator 刚加载或未变化时跳过
+    if (!prevId || !indicator || prevId === indicator.id) return;
+
+    // 切换指标时，如果输入框打开且有内容，自动保存到上一个指标
+    // 使用 ref 获取最新值，避免因闭包捕获旧值导致无法保存
+    if (showCommentInputRef.current && commentTextRef.current.trim()) {
+      onSaveCommentRef.current?.(prevId, commentTextRef.current.trim());
+    }
+
+    // 重置批注状态
+    setShowCommentInput(false);
+    setCommentText('');
+  }, [indicator?.id]);
 
   if (!indicator) return null;
 
@@ -17,12 +49,30 @@ export default function PdfStatusBar({ indicator, matchInfo, onConfirm, onDisput
     statusStyle = 'bg-amber-500/10 text-amber-400 border-amber-500/20';
   }
 
-  const handleSaveComment = useCallback(() => {
+  const handleSaveComment = useCallback(async () => {
     if (onSaveComment && commentText.trim()) {
-      onSaveComment(indicator.id, commentText.trim());
-      setShowCommentInput(false);
+      setSaving(true);
+      try {
+        await onSaveComment(indicator.id, commentText.trim());
+        setShowCommentInput(false);
+      } finally {
+        setSaving(false);
+      }
     }
   }, [onSaveComment, commentText, indicator.id]);
+
+  const handleDeleteComment = useCallback(async () => {
+    if (onSaveComment) {
+      setSaving(true);
+      try {
+        await onSaveComment(indicator.id, '');
+      } finally {
+        setSaving(false);
+      }
+      setShowCommentInput(false);
+      setCommentText('');
+    }
+  }, [onSaveComment, indicator.id]);
 
   const handleCancelComment = useCallback(() => {
     setShowCommentInput(false);
@@ -196,11 +246,21 @@ export default function PdfStatusBar({ indicator, matchInfo, onConfirm, onDisput
           <div className="flex items-center gap-2 pt-1">
             <button
               onClick={handleSaveComment}
-              disabled={!commentText.trim()}
+              disabled={!commentText.trim() || saving}
               className="px-3 py-1.5 text-xs rounded-lg bg-blue-500/15 hover:bg-blue-500/25 text-blue-400 border border-blue-500/30 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              保存
+              {saving ? '保存中...' : '保存'}
             </button>
+            {/* 删除批注按钮：已有批注时才显示 */}
+            {indicator.note && (
+              <button
+                onClick={handleDeleteComment}
+                disabled={saving}
+                className="px-3 py-1.5 text-xs rounded-lg bg-red-500/15 hover:bg-red-500/25 text-red-400 border border-red-500/30 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {saving ? '删除中...' : '删除'}
+              </button>
+            )}
             <button
               onClick={handleCancelComment}
               className="px-3 py-1.5 text-xs rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 border border-white/10 transition-all"

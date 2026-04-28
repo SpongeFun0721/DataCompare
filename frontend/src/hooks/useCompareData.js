@@ -5,7 +5,7 @@
  * 所有组件共享此 Hook 返回的状态和方法。
  */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import {
   uploadFiles as apiUpload,
   runAnalysis as apiAnalyze,
@@ -41,6 +41,9 @@ export function useCompareData() {
   const [selectedColors, setSelectedColors] = useState([]);
   const [colorMapping, setColorMapping] = useState({}); // { "#XXXXXX": "yearbook" | "report" | "url" }
   const [matchedPdfs, setMatchedPdfs] = useState([]); // 后端匹配到的 PDF 列表
+
+  // 保存批注的版本号，用于防止快速连续点击导致的竞态
+  const saveVersionRef = useRef(0);
 
   // ---- 上传文件 ----
   const upload = useCallback(async (excelFile, pdfFiles) => {
@@ -347,11 +350,32 @@ const selectIndicator = useCallback((id) => {
 
   // ---- 保存批注 ----
   const saveComment = useCallback(async (indicatorId, comment) => {
-    // 使用已有的 setReviewStatus 方法，保持当前状态不变，只更新 note
+    // 递增版本号，用于防止快速连续点击导致的竞态
+    saveVersionRef.current += 1;
+    const version = saveVersionRef.current;
+
     const indicator = indicators.find(ind => ind.id === indicatorId);
     if (!indicator) return;
-    await setReviewStatus(indicatorId, indicator.review_status, comment);
-  }, [indicators, setReviewStatus]);
+    await setReviewStatus(indicatorId, indicator.review_status || '未核对', comment);
+
+    // 如果版本号不匹配，说明有更新的请求已发出，丢弃当前结果
+    if (version !== saveVersionRef.current) return;
+
+    // 直接更新 currentMatches，避免 selectIndicator 读取旧的 allResults
+    if (selectedId === indicatorId) {
+      setCurrentMatches(prev => {
+        if (!prev || prev.indicator.id !== indicatorId) return prev;
+        return {
+          ...prev,
+          indicator: {
+            ...prev.indicator,
+            note: comment,
+            review_status: indicator.review_status || '未核对',
+          },
+        };
+      });
+    }
+  }, [indicators, setReviewStatus, selectedId, setCurrentMatches]);
 
   // ---- 切换选中颜色 ----
 

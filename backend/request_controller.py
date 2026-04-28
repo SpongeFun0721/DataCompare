@@ -2,33 +2,33 @@
 请求控制器 —— 为爬虫/数据采集项目提供完整的请求限流方案
 
 功能特性：
-1. 并发数控制（Semaphore）
-2. 请求重试机制（指数退避 + 随机抖动）
-3. 请求间隔策略（固定延时 + 随机抖动）
-4. 域名级别的令牌桶限流器
+1. 用户级任务隔离（UserTaskManager）：每个用户拥有独立的 Semaphore
+2. 域名级别的令牌桶限流器（全局共享，保护目标服务器）
+3. 请求重试机制（指数退避 + 随机抖动）
+4. 请求间隔策略（固定延时 + 随机抖动）
 5. 请求失败的降级处理
-6. 完整的日志记录
+6. 批次超时熔断：超时后返回部分结果，不抛异常
+7. 完整的日志记录
 
 使用示例：
-    controller = RequestController(
-        max_concurrent=5,          # 最大并发数
-        default_rate=10,           # 默认每秒请求数
-        retry_max=3,               # 最大重试次数
+    # 用户级隔离
+    manager = UserTaskManager()
+    
+    # 用户A的批次
+    results_a = await manager.run_batch(
+        user_id="user_a",
+        urls=[...],
+        max_concurrent=3,
+        batch_timeout=30.0,
     )
-
-    # 方式一：作为上下文管理器使用
-    async with controller.request("https://example.com/api") as resp:
-        data = await resp.json()
-
-    # 方式二：直接获取响应
-    resp = await controller.get("https://example.com/api")
-    data = resp.json()
-
-    # 方式三：批量请求
-    results = await controller.batch_get([
-        "https://example.com/page/1",
-        "https://example.com/page/2",
-    ])
+    
+    # 用户B的批次（完全独立，不受用户A影响）
+    results_b = await manager.run_batch(
+        user_id="user_b",
+        urls=[...],
+        max_concurrent=5,
+        batch_timeout=60.0,
+    )
 """
 
 from __future__ import annotations
@@ -556,7 +556,9 @@ class RequestController:
                     logger.error(f"批量请求失败: {url[:80]}: {e}")
                     return None
 
-        tasks = [_limited_get(url) for url in urls]
+        # 创建 Task 对象（asyncio.as_completed 和 asyncio.gather 需要 Task，不能传协程）
+        coros = [_limited_get(url) for url in urls]
+        tasks = [asyncio.create_task(coro) for coro in coros]
         results = []
 
         if on_progress:
@@ -597,7 +599,9 @@ class RequestController:
                     logger.error(f"批量请求失败: {req.get('url', '?')[:80]}: {e}")
                     return None
 
-        tasks = [_limited_request(req.copy()) for req in requests]
+        # 创建 Task 对象（asyncio.gather 需要 Task，不能传协程）
+        coros = [_limited_request(req.copy()) for req in requests]
+        tasks = [asyncio.create_task(coro) for coro in coros]
         return await asyncio.gather(*tasks)
 
     async def __aenter__(self):
@@ -815,64 +819,811 @@ class WebTextExtractor:
 
 
 # ============================================================
-# 8. 使用示例
+# 8. 用户级任务管理器（UserTaskManager）
+# ============================================================
+
+@dataclass
+class BatchResult:
+    """
+    用户批次请求的结果。
+    
+    包含部分成功和失败详情，超时后返回已完成的 partial 结果。
+    """
+    user_id: str
+    total: int
+    completed: int
+    failed: int
+    results: list[dict | None]
+    """每个 URL 的提取结果，顺序与输入 urls 一致，失败的为 None"""
+    errors: list[str | None]
+    """每个 URL 的错误信息，成功的为 None"""
+    elapsed: float
+    """实际耗时（秒）"""
+    cancelled: int = 0
+    """被取消的任务数（超时取消）"""
+    timed_out: bool = False
+    partial: bool = False
+    """是否为部分结果（超时返回）"""
+
+
+
+class UserTaskManager:
+    """
+    用户级任务管理器 —— 实现多用户并发安全的批量请求隔离。
+    
+    核心设计：
+    1. 每个用户批次拥有独立的 asyncio.Semaphore(3-5)，控制该用户内部并发数
+    2. 不同用户的任务互不影响：用户A的10个任务内部排队，不会拖慢用户B的请求
+    3. 域名级别的令牌桶（DomainRateLimiter）保持全局共享，保护目标服务器不被封 IP
+    4. 请求失败时禁止级联重试风暴，单个用户的重试不挤占其他用户的资源
+    5. 每个用户批次设置整体超时，超时后返回已抓取的部分结果并取消剩余任务
+    
+    使用示例：
+        manager = UserTaskManager(domain_configs={...})
+        
+        # 用户A的批次
+        results = await manager.run_batch(
+            user_id="user_a",
+            urls=[...],
+            max_concurrent=3,
+            batch_timeout=30.0,
+        )
+    """
+
+    def __init__(
+        self,
+        default_rate: float = 2.0,
+        retry_max: int = 2,
+        request_timeout: float = 20.0,
+        max_concurrent_per_domain: int = 2,
+        domain_configs: dict[str, RateLimitConfig] | None = None,
+    ):
+        """
+        Args:
+            default_rate: 默认每秒请求数（每个域名）
+            retry_max: 最大重试次数
+            request_timeout: 单个 HTTP 请求超时（秒）
+            max_concurrent_per_domain: 每个域名最大并发数
+            domain_configs: 域名特定的速率配置
+        """
+        # 全局共享的域名限流器（保护目标服务器）
+        self._rate_limiter = DomainRateLimiter(
+            default_config=RateLimitConfig(requests_per_second=default_rate),
+            domain_configs=domain_configs or {},
+        )
+
+        # 全局共享的重试处理器
+        self._retry_handler = RetryHandler(RetryConfig(max_retries=retry_max))
+
+        # 全局共享的域名级信号量
+        self._domain_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._domain_semaphores_lock = asyncio.Lock()
+        self._max_concurrent_per_domain = max_concurrent_per_domain
+
+        # 线程池（全局共享）
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=20,
+            thread_name_prefix="http_worker",
+        )
+
+        # 请求超时
+        self._request_timeout = request_timeout
+
+        # 统计信息
+        self._stats = {
+            "total_batches": 0,
+            "total_requests": 0,
+            "successful": 0,
+            "failed": 0,
+            "retried": 0,
+            "timed_out_batches": 0,
+        }
+        self._stats_lock = asyncio.Lock()
+
+    async def _get_domain_semaphore(self, domain: str) -> asyncio.Semaphore:
+        """获取或创建域名的信号量（懒加载，全局共享）。"""
+        async with self._domain_semaphores_lock:
+            if domain not in self._domain_semaphores:
+                self._domain_semaphores[domain] = asyncio.Semaphore(
+                    self._max_concurrent_per_domain
+                )
+            return self._domain_semaphores[domain]
+
+    def _get_domain(self, url: str) -> str:
+        """从 URL 中提取域名。"""
+        return urlparse(url).hostname or "unknown"
+
+    def _do_sync_request(
+        self,
+        method: str,
+        url: str,
+        timeout: float,
+    ) -> httpx.Response:
+        """
+        在线程池中执行的同步 HTTP 请求。
+        """
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+        ) as client:
+            return client.request(method, url)
+
+    async def _make_request(
+        self,
+        url: str,
+        user_semaphore: asyncio.Semaphore,
+        is_cancelled: asyncio.Event,
+    ) -> httpx.Response | None:
+        """
+        执行单个 HTTP 请求（用户级隔离 + 全局域名限流）。
+        
+        Args:
+            url: 请求 URL
+            user_semaphore: 用户级信号量
+            is_cancelled: 取消事件，被取消时返回 None
+        
+        Returns:
+            httpx.Response 或 None（被取消时）
+        """
+        domain = self._get_domain(url)
+        last_exception = None
+        last_response = None
+
+        async with self._stats_lock:
+            self._stats["total_requests"] += 1
+
+        for attempt in range(self._retry_handler.config.max_retries + 1):
+            # 检查是否被取消
+            if is_cancelled.is_set():
+                return None
+
+            # 重试退避（不占用用户信号量）
+            if attempt > 0:
+                delay = self._retry_handler.get_delay(attempt - 1)
+                # 分段等待，期间可响应取消
+                waited = 0.0
+                while waited < delay:
+                    if is_cancelled.is_set():
+                        return None
+                    wait_step = min(0.5, delay - waited)
+                    await asyncio.sleep(wait_step)
+                    waited += wait_step
+
+            # ================================================================
+            # 1. 域名级并发控制 + 限流等待（全局共享）
+            # ================================================================
+            domain_sem = await self._get_domain_semaphore(domain)
+            async with domain_sem:
+                # 域名令牌桶限流（全局共享）
+                await self._rate_limiter.acquire(domain)
+
+                # ================================================================
+                # 2. 用户级并发控制（用户独立）
+                # ================================================================
+                async with user_semaphore:
+                    # 再次检查取消
+                    if is_cancelled.is_set():
+                        return None
+
+                    try:
+                        loop = asyncio.get_running_loop()
+                        resp = await loop.run_in_executor(
+                            self._thread_pool,
+                            self._do_sync_request,
+                            "GET",
+                            url,
+                            self._request_timeout,
+                        )
+
+                        # 检查是否需要重试
+                        if self._retry_handler.should_retry(resp, None):
+                            async with self._stats_lock:
+                                self._stats["retried"] += 1
+                            last_response = resp
+                            logger.warning(
+                                f"[用户级] [{domain}] HTTP {resp.status_code} "
+                                f"将重试 {attempt + 1}/{self._retry_handler.config.max_retries}: "
+                                f"{url[:80]}"
+                            )
+                            continue
+
+                        # 成功
+                        async with self._stats_lock:
+                            self._stats["successful"] += 1
+                        return resp
+
+                    except Exception as e:
+                        last_exception = e
+                        if self._retry_handler.should_retry(None, e):
+                            async with self._stats_lock:
+                                self._stats["retried"] += 1
+                            logger.warning(
+                                f"[用户级] [{domain}] {type(e).__name__}: {e} "
+                                f"将重试 {attempt + 1}/{self._retry_handler.config.max_retries}: "
+                                f"{url[:80]}"
+                            )
+                            continue
+                        else:
+                            # 不可重试的错误
+                            async with self._stats_lock:
+                                self._stats["failed"] += 1
+                            logger.error(
+                                f"[用户级] [{domain}] 不可重试的错误: {e}: {url[:80]}"
+                            )
+                            return None
+
+        # 所有重试都失败
+        async with self._stats_lock:
+            self._stats["failed"] += 1
+        error_msg = f"请求失败（已重试 {self._retry_handler.config.max_retries} 次）: {url[:80]}"
+        if last_response is not None:
+            logger.error(f"{error_msg} 最后响应: HTTP {last_response.status_code}")
+            return last_response  # 降级返回
+        if last_exception is not None:
+            logger.error(f"{error_msg} 最后异常: {last_exception}")
+        return None
+
+    async def run_batch(
+        self,
+        user_id: str,
+        urls: list[str],
+        max_concurrent: int = 3,
+        batch_timeout: float = 30.0,
+    ) -> BatchResult:
+        """
+        执行用户批次的批量请求。
+        
+        特性：
+        - 每个用户批次拥有独立的 Semaphore
+        - 支持整体超时熔断，超时后返回部分结果
+        - 被取消的任务不触发重试
+        - 错误只在当前用户范围内传播
+        
+        Args:
+            user_id: 用户 ID
+            urls: URL 列表
+            max_concurrent: 该用户批次的最大并发数（3-5 推荐）
+            batch_timeout: 批次整体超时（秒），默认 30 秒
+        
+        Returns:
+            BatchResult: 包含部分成功和失败详情
+        """
+        start_time = time.monotonic()
+        total = len(urls)
+
+        async with self._stats_lock:
+            self._stats["total_batches"] += 1
+
+        logger.info(
+            f"[用户={user_id}] 开始批量请求: {total} 个 URL, "
+            f"并发={max_concurrent}, 超时={batch_timeout}s"
+        )
+
+        # 用户级信号量（独立于其他用户）
+        user_semaphore = asyncio.Semaphore(max_concurrent)
+
+        # 取消事件
+        is_cancelled = asyncio.Event()
+
+        # 创建所有任务
+        async def _task_wrapper(url: str, idx: int) -> tuple[int, httpx.Response | None, str | None]:
+            """包装任务，返回 (index, response, error_message)。"""
+            try:
+                resp = await self._make_request(url, user_semaphore, is_cancelled)
+                if resp is not None:
+                    return idx, resp, None
+                else:
+                    return idx, None, f"请求失败: {url[:80]}"
+            except asyncio.CancelledError:
+                # 被取消的任务返回 "cancelled" 标记，不记录 error 日志
+                return idx, None, "cancelled"
+            except Exception as e:
+                return idx, None, f"未知错误: {e}"
+
+        # 创建 Task 对象（asyncio.wait 需要 Task，不能传协程）
+        coros = [_task_wrapper(url, i) for i, url in enumerate(urls)]
+        tasks = [asyncio.create_task(coro) for coro in coros]
+
+        # 使用 asyncio.wait 实现超时熔断
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=batch_timeout,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+        except Exception as e:
+            logger.error(f"[用户={user_id}] asyncio.wait 异常: {e}")
+            done = set()
+            pending = set(tasks)
+
+        # 超时处理
+        timed_out = len(pending) > 0
+        if timed_out:
+            async with self._stats_lock:
+                self._stats["timed_out_batches"] += 1
+
+            # 设置取消事件，通知还在运行的任务停止
+            is_cancelled.set()
+
+            # 取消所有 pending 任务
+            for task in pending:
+                task.cancel()
+
+            # 等待所有 pending 任务完成取消
+            if pending:
+                await asyncio.wait(pending, timeout=5.0)
+
+            logger.warning(
+                f"[用户={user_id}] 批次超时: {batch_timeout}s, "
+                f"已完成 {len(done)}/{total}, 已取消 {len(pending)}"
+            )
+
+        # 收集结果
+        results_map: dict[int, tuple[httpx.Response | None, str | None]] = {}
+
+        # 处理已完成的任务
+        for task in done:
+            try:
+                idx, resp, error = await task
+                results_map[idx] = (resp, error)
+            except Exception as e:
+                # 任务本身可能已经失败
+                pass
+
+        # 处理被取消的任务
+        for task in pending:
+            try:
+                idx, resp, error = await task
+                results_map[idx] = (resp, error)
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # 按原始顺序构建结果
+        final_results: list[dict | None] = []
+        final_errors: list[str | None] = []
+        completed_count = 0
+        failed_count = 0
+        cancelled_count = 0
+
+        for i in range(total):
+            if i in results_map:
+                resp, error = results_map[i]
+                if resp is not None and error is None:
+                    completed_count += 1
+                    final_results.append({"url": urls[i], "response": resp})
+                    final_errors.append(None)
+                elif error == "cancelled":
+                    # 被取消的任务单独统计
+                    cancelled_count += 1
+                    final_results.append(None)
+                    final_errors.append("cancelled")
+                else:
+                    failed_count += 1
+                    final_results.append(None)
+                    final_errors.append(error or f"未知错误: {urls[i][:80]}")
+            else:
+                # 任务完全丢失（极低概率）
+                failed_count += 1
+                final_results.append(None)
+                final_errors.append(f"任务丢失: {urls[i][:80]}")
+
+        elapsed = time.monotonic() - start_time
+
+        logger.info(
+            f"[用户={user_id}] 批次完成: "
+            f"成功={completed_count}, 失败={failed_count}, "
+            f"取消={cancelled_count}, 超时={timed_out}, 耗时={elapsed:.2f}s"
+        )
+
+        return BatchResult(
+            user_id=user_id,
+            total=total,
+            completed=completed_count,
+            failed=failed_count,
+            cancelled=cancelled_count,
+            timed_out=timed_out,
+            partial=timed_out,
+            results=final_results,
+            errors=final_errors,
+            elapsed=elapsed,
+        )
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        """获取统计信息快照。"""
+        return dict(self._stats)
+
+    def print_stats(self):
+        """打印统计信息。"""
+        stats = self.stats
+        logger.info("=" * 50)
+        logger.info("用户级任务管理器统计信息")
+        logger.info("=" * 50)
+        logger.info(f"  总批次:       {stats['total_batches']}")
+        logger.info(f"  总请求数:     {stats['total_requests']}")
+        logger.info(f"  成功:         {stats['successful']}")
+        logger.info(f"  失败:         {stats['failed']}")
+        logger.info(f"  重试次数:     {stats['retried']}")
+        logger.info(f"  超时批次:     {stats['timed_out_batches']}")
+        if stats['total_requests'] > 0:
+            success_rate = stats['successful'] / stats['total_requests'] * 100
+            logger.info(f"  成功率:       {success_rate:.1f}%")
+        logger.info("=" * 50)
+
+
+# ============================================================
+# 9. 增强版 WebTextExtractor（集成 Redis 缓存）
+# ============================================================
+
+class CachedWebTextExtractor:
+    """
+    增强版网页文本提取器 —— 集成 Redis 缓存 + 用户级任务隔离。
+    
+    功能特性：
+    1. 优先读 Redis 缓存，命中直接返回
+    2. 未命中再走网络请求（通过 UserTaskManager）
+    3. 缓存过期时间：成功页面 7 天，失败页面 10 分钟
+    4. Redis 不可用时自动降级到内存 dict
+    5. 支持用户级任务隔离
+    """
+
+    def __init__(
+        self,
+        task_manager: UserTaskManager | None = None,
+        redis_cache: Any | None = None,
+        max_lines: int = 500,
+        max_chars: int = 50000,
+    ):
+        """
+        Args:
+            task_manager: UserTaskManager 实例，不传则使用默认配置
+            redis_cache: RedisCache 实例，不传则不使用 Redis 缓存
+            max_lines: HTML 页面最多提取的行数
+            max_chars: 非 HTML 内容最多提取的字符数
+        """
+        self.task_manager = task_manager or UserTaskManager()
+        self.redis_cache = redis_cache
+        self.max_lines = max_lines
+        self.max_chars = max_chars
+
+        # 内存缓存（Redis 降级方案 + 二次缓存）
+        self._memory_cache: dict[str, dict] = {}
+        self._cache_hits = 0
+        self._memory_hits = 0
+
+    async def extract(
+        self,
+        url: str,
+        user_id: str = "default",
+    ) -> dict:
+        """
+        提取单个 URL 的网页文本（带 Redis 缓存）。
+        
+        缓存优先级：Redis > 内存 > 网络请求
+        
+        Args:
+            url: 目标 URL
+            user_id: 用户 ID（用于统计）
+        
+        Returns:
+            {"url": ..., "title": ..., "text": ..., "cached": bool}
+        """
+        cache_key = f"web_cache:{url}"
+
+        # ============================================================
+        # 1. 尝试 Redis 缓存
+        # ============================================================
+        if self.redis_cache is not None:
+            try:
+                cached = await self.redis_cache.get(cache_key)
+                if cached is not None:
+                    self._cache_hits += 1
+                    logger.info(f"[Redis缓存命中] {url[:60]}...")
+                    return cached
+            except Exception:
+                pass
+
+        # ============================================================
+        # 2. 尝试内存缓存
+        # ============================================================
+        if url in self._memory_cache:
+            self._memory_hits += 1
+            logger.info(f"[内存缓存命中] {url[:60]}...")
+            result = self._memory_cache[url]
+            result["cached"] = True
+            return result
+
+        # ============================================================
+        # 3. 网络请求
+        # ============================================================
+        try:
+            batch_result = await self.task_manager.run_batch(
+                user_id=user_id,
+                urls=[url],
+                max_concurrent=1,
+                batch_timeout=self.task_manager._request_timeout + 10,
+            )
+
+            if batch_result.completed > 0 and batch_result.results[0] is not None:
+                resp = batch_result.results[0]["response"]
+                result = self._parse_response(url, resp)
+                result["cached"] = False
+            else:
+                error_msg = batch_result.errors[0] if batch_result.errors else "获取失败"
+                result = {
+                    "url": url,
+                    "title": "",
+                    "text": f"获取失败: {error_msg}",
+                    "cached": False,
+                }
+        except Exception as e:
+            logger.exception(f"WebTextExtractor 失败: {url}")
+            result = {
+                "url": url,
+                "title": "",
+                "text": f"获取失败: {e}",
+                "cached": False,
+            }
+
+        # ============================================================
+        # 4. 写入缓存
+        # ============================================================
+        is_success = not result.get("text", "").startswith("获取失败")
+        ttl = 7 * 24 * 3600 if is_success else 10 * 60  # 成功7天，失败10分钟
+
+        # 写入内存缓存
+        self._memory_cache[url] = result
+
+        # 写入 Redis 缓存
+        if self.redis_cache is not None:
+            try:
+                await self.redis_cache.set(cache_key, result, ttl=ttl)
+            except Exception:
+                pass
+
+        return result
+
+    async def extract_batch(
+        self,
+        urls: list[str],
+        user_id: str = "default",
+        max_concurrent: int = 3,
+        batch_timeout: float = 30.0,
+    ) -> list[dict]:
+        """
+        批量提取多个 URL 的网页文本。
+        
+        已缓存的直接返回，未缓存的通过 UserTaskManager 限流获取。
+        
+        Args:
+            urls: URL 列表
+            user_id: 用户 ID
+            max_concurrent: 该用户批次的最大并发数
+            batch_timeout: 批次整体超时（秒）
+        
+        Returns:
+            [{"url": ..., "title": ..., "text": ..., "cached": bool}, ...]
+        """
+        # 区分已缓存和未缓存的 URL
+        cached_results: dict[str, dict] = {}
+        uncached_urls: list[str] = []
+
+        for url in urls:
+            cache_key = f"web_cache:{url}"
+            found = False
+
+            # 尝试 Redis 缓存
+            if self.redis_cache is not None:
+                try:
+                    cached = await self.redis_cache.get(cache_key)
+                    if cached is not None:
+                        self._cache_hits += 1
+                        cached["cached"] = True
+                        cached_results[url] = cached
+                        found = True
+                except Exception:
+                    pass
+
+            if not found:
+                # 尝试内存缓存
+                if url in self._memory_cache:
+                    self._memory_hits += 1
+                    result = self._memory_cache[url]
+                    result["cached"] = True
+                    cached_results[url] = result
+                    found = True
+
+            if not found:
+                uncached_urls.append(url)
+
+        # 未缓存的通过 UserTaskManager 批量获取
+        if uncached_urls:
+            batch_result = await self.task_manager.run_batch(
+                user_id=user_id,
+                urls=uncached_urls,
+                max_concurrent=max_concurrent,
+                batch_timeout=batch_timeout,
+            )
+
+            for i, url in enumerate(uncached_urls):
+                if i < len(batch_result.results) and batch_result.results[i] is not None:
+                    resp = batch_result.results[i]["response"]
+                    result = self._parse_response(url, resp)
+                    result["cached"] = False
+                else:
+                    error_msg = (
+                        batch_result.errors[i]
+                        if i < len(batch_result.errors) and batch_result.errors[i]
+                        else "获取失败"
+                    )
+                    result = {
+                        "url": url,
+                        "title": "",
+                        "text": f"获取失败: {error_msg}",
+                        "cached": False,
+                    }
+
+                # 写入缓存
+                is_success = not result.get("text", "").startswith("获取失败")
+                ttl = 7 * 24 * 3600 if is_success else 10 * 60
+                self._memory_cache[url] = result
+                if self.redis_cache is not None:
+                    try:
+                        await self.redis_cache.set(
+                            f"web_cache:{url}", result, ttl=ttl
+                        )
+                    except Exception:
+                        pass
+
+                cached_results[url] = result
+
+        # 按原始顺序返回
+        return [cached_results[url] for url in urls]
+
+    def _parse_response(self, url: str, resp: httpx.Response) -> dict:
+        """
+        解析 HTTP 响应，提取标题和正文。
+        与原始 WebTextExtractor 相同的解析逻辑。
+        """
+        from bs4 import BeautifulSoup
+        import re
+
+        content_type = resp.headers.get("content-type", "")
+        title = ""
+        text = ""
+
+        # 编码检测与解码
+        encoding = None
+        charset_match = re.search(r'charset=([\w-]+)', content_type, re.IGNORECASE)
+        if charset_match:
+            encoding = charset_match.group(1)
+
+        raw_content = resp.content
+
+        if "text/html" in content_type or "application/xhtml" in content_type:
+            if not encoding:
+                meta_charset = re.search(
+                    rb'<meta[^>]+charset\s*=\s*["\']?([\w-]+)["\']?',
+                    raw_content[:4096],
+                    re.IGNORECASE
+                )
+                if meta_charset:
+                    encoding = meta_charset.group(1).decode('ascii', errors='ignore')
+                else:
+                    meta_http_equiv = re.search(
+                        rb'<meta[^>]+http-equiv\s*=\s*["\']?Content-Type["\']?[^>]+charset=([\w-]+)',
+                        raw_content[:4096],
+                        re.IGNORECASE
+                    )
+                    if meta_http_equiv:
+                        encoding = meta_http_equiv.group(1).decode('ascii', errors='ignore')
+
+        if encoding:
+            try:
+                decoded_text = raw_content.decode(encoding, errors='replace')
+            except (LookupError, UnicodeDecodeError):
+                decoded_text = resp.text
+        else:
+            decoded_text = resp.text
+
+        # 正文提取
+        if "text/html" in content_type or "application/xhtml" in content_type:
+            soup = BeautifulSoup(decoded_text, "html.parser")
+            if soup.title:
+                title = soup.title.get_text(strip=True)
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside",
+                             "noscript", "iframe", "svg", "form", "button"]):
+                tag.decompose()
+            body = soup.find("body")
+            if body:
+                text = body.get_text(separator="\n", strip=True)
+            else:
+                text = soup.get_text(separator="\n", strip=True)
+            lines = [line.strip() for line in text.split("\n") if line.strip()]
+            text = "\n".join(lines[:self.max_lines])
+        else:
+            text = decoded_text[:self.max_chars]
+
+        return {"url": url, "title": title, "text": text}
+
+    @property
+    def stats(self) -> dict:
+        """获取统计信息。"""
+        return {
+            "redis_cache_hits": self._cache_hits,
+            "memory_cache_hits": self._memory_hits,
+            "memory_cache_size": len(self._memory_cache),
+            "task_manager": self.task_manager.stats,
+        }
+
+    def print_stats(self):
+        """打印统计信息。"""
+        self.task_manager.print_stats()
+        stats = self.stats
+        logger.info(f"  Redis 缓存命中: {stats['redis_cache_hits']}")
+        logger.info(f"  内存缓存命中:   {stats['memory_cache_hits']}")
+        logger.info(f"  内存缓存大小:   {stats['memory_cache_size']}")
+
+
+# ============================================================
+# 10. 使用示例
 # ============================================================
 
 async def demo():
-    """演示如何使用 RequestController。"""
-    import httpx
-
-    # 配置日志
+    """演示如何使用 UserTaskManager 和 CachedWebTextExtractor。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
 
-    # 创建控制器
-    controller = RequestController(
-        max_concurrent=3,                    # 最多 3 个并发
-        default_rate=5.0,                    # 每个域名每秒最多 5 个请求
-        retry_max=2,                         # 最多重试 2 次
-        timeout=15.0,                        # 超时 15 秒
+    # 示例 1：使用 UserTaskManager 进行用户级隔离
+    manager = UserTaskManager(
+        default_rate=2.0,
+        retry_max=2,
+        request_timeout=20.0,
         domain_configs={
-            "fencing.sport.org.cn": RateLimitConfig(
-                requests_per_second=2,       # 这个域名每秒最多 2 个请求
-                burst_size=3,                # 突发容量 3
-                min_interval=0.5,            # 最小间隔 0.5 秒
-            ),
-            "www.sport.gov.cn": RateLimitConfig(
-                requests_per_second=3,
-                burst_size=5,
+            "httpbin.org": RateLimitConfig(
+                requests_per_second=5,
+                burst_size=3,
+                min_interval=0.5,
             ),
         },
     )
 
-    # 示例 1：单个请求
-    try:
-        resp = await controller.get("https://httpbin.org/get")
-        print(f"单个请求成功: HTTP {resp.status_code}")
-    except Exception as e:
-        print(f"单个请求失败: {e}")
-
-    # 示例 2：批量请求
-    urls = [
-        "https://httpbin.org/delay/1",
-        "https://httpbin.org/delay/2",
-        "https://httpbin.org/delay/1",
-    ]
-    results = await controller.batch_get(
-        urls,
-        on_progress=lambda done, total: print(f"进度: {done}/{total}"),
+    # 用户A的批次
+    print("\n=== 用户A 批次 ===")
+    result_a = await manager.run_batch(
+        user_id="user_a",
+        urls=[
+            "https://httpbin.org/delay/1",
+            "https://httpbin.org/delay/2",
+            "https://httpbin.org/delay/1",
+        ],
+        max_concurrent=3,
+        batch_timeout=30.0,
     )
-    print(f"批量请求完成: {sum(1 for r in results if r is not None)}/{len(results)} 成功")
+    print(f"用户A: {result_a.completed}/{result_a.total} 成功, 超时={result_a.timed_out}")
 
-    # 示例 3：使用上下文管理器
-    async with RequestController(max_concurrent=5) as ctrl:
-        resp = await ctrl.get("https://httpbin.org/get")
-        print(f"上下文管理器请求: HTTP {resp.status_code}")
+    # 用户B的批次（完全独立）
+    print("\n=== 用户B 批次 ===")
+    result_b = await manager.run_batch(
+        user_id="user_b",
+        urls=[
+            "https://httpbin.org/delay/3",
+            "https://httpbin.org/delay/1",
+        ],
+        max_concurrent=2,
+        batch_timeout=10.0,  # 短超时
+    )
+    print(f"用户B: {result_b.completed}/{result_b.total} 成功, 超时={result_b.timed_out}")
 
-    # 示例 4：打印统计信息
-    controller.print_stats()
+    manager.print_stats()
+
+    # 示例 2：使用 CachedWebTextExtractor
+    print("\n=== CachedWebTextExtractor ===")
+    extractor = CachedWebTextExtractor(task_manager=manager)
+    result = await extractor.extract("https://httpbin.org/get", user_id="user_c")
+    print(f"提取结果: title={result.get('title', '')}, text_len={len(result.get('text', ''))}")
 
 
 if __name__ == "__main__":
