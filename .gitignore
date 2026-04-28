@@ -10,7 +10,7 @@ output/
 data/
 backend/data
 backend/uploads
-
+Redis/
 # Virtual environments
 .venv
 .pdf_cache
