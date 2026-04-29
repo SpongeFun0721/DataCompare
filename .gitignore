@@ -2,7 +2,6 @@
 __pycache__/
 *.py[oc]
 build/
-dist/
 wheels/
 *.egg-info
 uploads/
@@ -15,4 +14,9 @@ dump.rdb
 # Virtual environments
 .venv
 .pdf_cache
-
+# Release build output
+dist_release/
+frontend/dist/
+uv
+DataCompare/
+build_release.py

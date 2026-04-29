@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -21,6 +22,15 @@ from backend.models import IndicatorResult, Indicator
 from backend.config import OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
+
+# 尝试导入 win32com
+try:
+    import win32com.client
+    from win32com.client import constants
+    HAS_WIN32COM = True
+except ImportError:
+    HAS_WIN32COM = False
+    logger.warning("win32com 未安装，线程化批注功能不可用。请执行: pip install pywin32")
 
 # 样式定义
 HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
@@ -86,6 +96,86 @@ def generate_report(
     return output_path
 
 
+def _add_threaded_comment_win32com(
+    excel_path: str | Path,
+    output_path: str | Path,
+    row_idx: int,
+    col_idx: int,
+    note_text: str,
+) -> None:
+    """
+    使用 win32com 在指定单元格添加线程化批注（现代批注）。
+
+    优先使用 AddCommentThreaded（线程化批注），若不支持则降级为 AddComment。
+
+    Args:
+        excel_path: 源 Excel 文件路径
+        output_path: 输出 Excel 文件路径
+        row_idx: 单元格行号（1-based）
+        col_idx: 单元格列号（1-based）
+        note_text: 批注文本内容
+    """
+    if not HAS_WIN32COM:
+        logger.warning("win32com 不可用，跳过线程化批注写入")
+        return
+
+    excel = None
+    wb = None
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+
+        wb = excel.Workbooks.Open(str(excel_path))
+        ws = wb.ActiveSheet
+
+        # 清除该单元格可能存在的旧批注
+        ws.Range(
+            ws.Cells(row_idx, col_idx),
+            ws.Cells(row_idx, col_idx),
+        ).ClearComments()
+
+        target_range = ws.Cells(row_idx, col_idx)
+
+        try:
+            # 优先尝试线程化批注（现代批注）
+            target_range.AddCommentThreaded(note_text)
+            logger.debug(f"已添加线程化批注: 行{row_idx} 列{col_idx}")
+        except AttributeError:
+            # 降级：使用传统批注
+            logger.warning("当前 Excel 版本不支持线程化批注，降级为传统批注")
+            try:
+                target_range.AddComment(note_text)
+                logger.debug(f"已添加传统批注: 行{row_idx} 列{col_idx}")
+            except Exception as e:
+                logger.warning(f"添加传统批注失败 (行{row_idx} 列{col_idx}): {e}")
+        except Exception as e:
+            logger.warning(f"添加线程化批注失败 (行{row_idx} 列{col_idx}): {e}")
+            # 尝试降级
+            try:
+                target_range.AddComment(note_text)
+                logger.debug(f"降级后已添加传统批注: 行{row_idx} 列{col_idx}")
+            except Exception as e2:
+                logger.warning(f"降级添加传统批注也失败 (行{row_idx} 列{col_idx}): {e2}")
+
+        # 保存为 xlsx 格式 (FileFormat=51)
+        wb.SaveAs(str(output_path), FileFormat=51)
+
+    except Exception as e:
+        logger.warning(f"win32com 批注处理失败: {e}")
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+
+
 def generate_colored_original_excel(
     results: list[IndicatorResult],
     excel_path: str | Path,
@@ -95,6 +185,9 @@ def generate_colored_original_excel(
     在原表基础上生成标色版本。
     绿色（已核对）
     黄色（未核对）
+
+    批注使用 win32com 实现线程化批注（现代批注），
+    若 Excel 版本不支持则自动降级为传统批注。
     """
     if output_path is None:
         output_path = OUTPUT_DIR / "标色原表.xlsx"
@@ -103,6 +196,7 @@ def generate_colored_original_excel(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # ---- 第一步：使用 openpyxl 处理标色逻辑 ----
     wb = load_workbook(str(excel_path))
     ws = wb.active
 
@@ -117,6 +211,9 @@ def generate_colored_original_excel(
         "已核对": Font(color="000000"),     # 不改变字体
         "未核对": Font(color="FF6600"),    # 橙色字体（不改背景色，避免覆盖原有分类颜色）
     }
+
+    # 收集需要添加批注的信息（行号、列号、批注内容）
+    comment_targets: list[tuple[int, int, str]] = []
 
     for result in results:
         ind = result.indicator
@@ -144,20 +241,128 @@ def generate_colored_original_excel(
                 ws.cell(row=row_idx, column=c).font = font_color
             target_cell = ws.cell(row=row_idx, column=1)
 
-        # ---- 写入批注（comment） ----
-        # 如果 indicator.note 不为空，则在目标单元格上添加批注
+        # 收集批注信息（使用 openpyxl 的列索引）
         if ind.note and ind.note.strip():
-            comment = Comment(
-                text=ind.note.strip(),
-                author="核对人员",
-            )
-            comment.width = 300
-            comment.height = 100
-            target_cell.comment = comment
+            # 确定批注目标列：优先使用 col_idx，否则使用第1列
+            comment_col = col_idx if col_idx else 1
+            comment_targets.append((row_idx, comment_col, ind.note.strip()))
 
-    wb.save(str(output_path))
+    # 先保存标色后的中间文件（使用临时路径）
+    temp_path = output_path.with_suffix(".tmp.xlsx")
+    wb.save(str(temp_path))
+    wb.close()
+
+    # ---- 第二步：使用 win32com 添加线程化批注 ----
+    if comment_targets and HAS_WIN32COM:
+        _add_threaded_comments_batch(temp_path, output_path, comment_targets)
+        # 删除临时文件
+        try:
+            temp_path.unlink()
+        except Exception:
+            pass
+    else:
+        # 没有批注或 win32com 不可用，直接重命名临时文件为最终输出
+        if not HAS_WIN32COM and comment_targets:
+            logger.warning("win32com 不可用，批注将以 openpyxl 旧版批注形式保留")
+            # 重新加载并添加旧版批注
+            wb2 = load_workbook(str(temp_path))
+            ws2 = wb2.active
+            for row_idx, col_idx, note_text in comment_targets:
+                comment = Comment(text=note_text, author="核对人员")
+                comment.width = 300
+                comment.height = 100
+                ws2.cell(row=row_idx, column=col_idx).comment = comment
+            wb2.save(str(output_path))
+            wb2.close()
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+        else:
+            # 没有批注需要添加，直接重命名
+            import shutil
+            shutil.move(str(temp_path), str(output_path))
+
     logger.info(f"标色原表已生成: {output_path}")
     return output_path
+
+
+def _add_threaded_comments_batch(
+    temp_path: Path,
+    output_path: Path,
+    comment_targets: list[tuple[int, int, str]],
+) -> None:
+    """
+    批量使用 win32com 添加线程化批注。
+
+    Args:
+        temp_path: openpyxl 处理后的临时文件路径
+        output_path: 最终输出文件路径
+        comment_targets: 列表，每项为 (row_idx, col_idx, note_text)
+    """
+    excel = None
+    wb = None
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+
+        wb = excel.Workbooks.Open(str(temp_path))
+        ws = wb.ActiveSheet
+
+        for row_idx, col_idx, note_text in comment_targets:
+            try:
+                target_range = ws.Cells(row_idx, col_idx)
+
+                # 清除可能存在的旧批注
+                target_range.ClearComments()
+
+                try:
+                    # 优先尝试线程化批注（现代批注）
+                    target_range.AddCommentThreaded(note_text)
+                    logger.debug(f"已添加线程化批注: 行{row_idx} 列{col_idx}")
+                except AttributeError:
+                    # 降级：使用传统批注
+                    logger.warning("当前 Excel 版本不支持线程化批注，降级为传统批注")
+                    try:
+                        target_range.AddComment(note_text)
+                        logger.debug(f"已添加传统批注: 行{row_idx} 列{col_idx}")
+                    except Exception as e:
+                        logger.warning(f"添加传统批注失败 (行{row_idx} 列{col_idx}): {e}")
+                except Exception as e:
+                    logger.warning(f"添加线程化批注失败 (行{row_idx} 列{col_idx}): {e}")
+                    # 尝试降级
+                    try:
+                        target_range.AddComment(note_text)
+                        logger.debug(f"降级后已添加传统批注: 行{row_idx} 列{col_idx}")
+                    except Exception as e2:
+                        logger.warning(f"降级添加传统批注也失败 (行{row_idx} 列{col_idx}): {e2}")
+
+            except Exception as e:
+                logger.warning(f"批注处理异常 (行{row_idx} 列{col_idx}): {e}")
+                continue
+
+        # 保存为 xlsx 格式 (FileFormat=51)
+        wb.SaveAs(str(output_path), FileFormat=51)
+        logger.info(f"win32com 批注处理完成，已保存至: {output_path}")
+
+    except Exception as e:
+        logger.warning(f"win32com 批注处理失败: {e}")
+        # 如果失败，尝试将临时文件复制为输出文件
+        import shutil
+        shutil.copy2(str(temp_path), str(output_path))
+        logger.info(f"win32com 处理失败，已使用 openpyxl 版本: {output_path}")
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
 
 
 def _apply_header_style(ws, row: int, max_col: int):

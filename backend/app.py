@@ -259,39 +259,30 @@ def build_pdf_index():
     # --- 使用 glob 匹配年鉴 PDF（支持 年鉴2022.pdf、年鉴2023.pdf、中国体育年鉴.pdf 等变体）---
     yearbook_files = sorted(pdf_dir.glob("*年鉴*.pdf"))
     yearbook_index.clear()
-    print(f"\n=== DEBUG build_pdf_index ===")
-    print(f"  搜索目录: {pdf_dir}")
-    print(f"  glob(*年鉴*.pdf) 找到 {len(yearbook_files)} 个文件")
+    logger.debug(f"build_pdf_index: 搜索目录={pdf_dir}, glob(*年鉴*.pdf) 找到 {len(yearbook_files)} 个文件")
     if yearbook_files:
         for yb_path in yearbook_files:
             yb_name = yb_path.name
-            print(f"  发现年鉴文件: {repr(yb_name)}")
+            logger.debug(f"发现年鉴文件: {repr(yb_name)}")
             # 从文件名中提取年份
             year_match = re.search(r'(\d{4})', yb_name)
             if year_match:
                 year_str = year_match.group(1)
                 yearbook_index[year_str] = yb_name
                 logger.info(f"年鉴 PDF 索引: 年份 {year_str} -> {yb_name}")
-                print(f"  ✅ 索引: yearbook_index['{year_str}'] = '{yb_name}'")
             else:
                 # 无年份的作为默认年鉴
                 yearbook_index["default"] = yb_name
                 logger.info(f"年鉴 PDF 索引(默认): {yb_name}")
-                print(f"  ⚠️ 无年份, 设为默认: yearbook_index['default'] = '{yb_name}'")
 
         logger.info(f"找到 {len(yearbook_files)} 个年鉴 PDF: {list(yearbook_index.keys())}")
-        print(f"  最终 yearbook_index: {yearbook_index}")
     else:
         logger.warning("未找到年鉴 PDF (glob: *年鉴*.pdf)")
-        print(f"  ❌ 未找到年鉴 PDF!")
         # 列出目录下所有 PDF 文件，检查文件名编码
         all_files = list(pdf_dir.glob("*.pdf"))
-        print(f"  目录下共有 {len(all_files)} 个 PDF 文件:")
+        logger.debug(f"目录下共有 {len(all_files)} 个 PDF 文件")
         for f in all_files[:10]:
-            print(f"    - {repr(f.name)}")
-        if len(all_files) > 10:
-            print(f"    ... (共 {len(all_files)} 个)")
-    print(f"=== DEBUG END ===\n")
+            logger.debug(f"  - {repr(f.name)}")
 
     # --- 加载 map.json ---
     map_path = DATA_DIR / "map.json"
@@ -579,9 +570,9 @@ async def run_analysis(
         # 手动调用 _match_pdf_name 测试
         from backend.comparator import Comparator
         pdf_names = [p.name for p in Path(pdf_dir).glob("*.pdf")]
-        print(f"  目录中所有 PDF ({len(pdf_names)}):")
-        for pn in sorted(pdf_names):
-            print(f"    - {pn}")
+        # print(f"  目录中所有 PDF ({len(pdf_names)}):")
+        # for pn in sorted(pdf_names):
+        #     print(f"    - {pn}")
         
         # 对第一个指标的 report source 做匹配测试
         source_pages = Comparator._parse_source_file(first.source_file)

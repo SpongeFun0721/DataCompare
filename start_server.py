@@ -26,14 +26,14 @@ logger = logging.getLogger(__name__)
 
 def _find_redis_service() -> Path | None:
     """
-    从项目根目录向下查找 RedisService.exe。
+    从项目根目录向下查找 redis-server.exe。
     
-    查找路径：BASE_DIR / "Redis" / "RedisService.exe"
+    查找路径：BASE_DIR / "Redis" / "redis-server.exe"
     
     Returns:
-        Path | None: RedisService.exe 的路径，如果未找到则返回 None
+        Path | None: redis-server.exe 的路径，如果未找到则返回 None
     """
-    redis_service_path = BASE_DIR / "Redis" / "RedisService.exe"
+    redis_service_path = BASE_DIR / "Redis" / "redis-server.exe"
     if redis_service_path.exists():
         logger.info(f"🔍 找到 Redis 服务: {redis_service_path}")
         return redis_service_path
@@ -47,7 +47,7 @@ def _try_start_redis() -> bool:
     
     检测策略：
     1. 先检查环境变量 REDIS_URL（用户自行管理的外部 Redis）
-    2. 从项目根目录查找 Redis/RedisService.exe
+    2. 从项目根目录查找 Redis/redis-server.exe
     3. 如果找到则启动它
     4. 如果 Redis 已经在运行（端口占用），视为成功
     5. 如果启动失败，记录警告但不阻止服务器启动
@@ -73,14 +73,14 @@ def _try_start_redis() -> bool:
     except Exception:
         pass
 
-    # 从项目根目录查找 RedisService.exe
+    # 从项目根目录查找 redis-server.exe
     redis_exe = _find_redis_service()
     if redis_exe is None:
         logger.warning("   应用将使用内存缓存降级运行")
-        logger.warning("   如需 Redis 缓存，请确保 Redis/RedisService.exe 存在于项目根目录")
+        logger.warning("   如需 Redis 缓存，请确保 Redis/redis-server.exe 存在于项目根目录")
         return False
 
-    # 尝试启动 RedisService.exe
+    # 尝试启动 redis-server.exe
     try:
         logger.info(f"🚀 正在启动 Redis 服务: {redis_exe}...")
         # 使用 subprocess.Popen 后台启动
@@ -116,6 +116,9 @@ def _try_start_redis() -> bool:
 
 
 def main():
+    # 切换到脚本所在目录，确保相对路径解析正确
+    os.chdir(str(BASE_DIR))
+
     parser = argparse.ArgumentParser(description="启动数据比对工具生产服务器")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
     parser.add_argument("--port", type=int, default=8000, help="监听端口（默认 8000）")
