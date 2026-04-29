@@ -151,12 +151,18 @@ export default function MatchPanel({
 
         // 1. 优先从 IndexedDB 本地缓存读取
         const cachedBlob = await getFromCache(name);
-        if (cachedBlob) {
+        if (cachedBlob && cachedBlob.size > 0) {
           const blobUrl = URL.createObjectURL(cachedBlob);
           cache[name] = blobUrl;
           console.log(`📦 PDF 从本地缓存加载: ${name} (${cachedBlob.size} bytes)`);
           continue;
         }
+
+        // 如果存在损坏/0字节缓存，清理它
+        if (cachedBlob && cachedBlob.size === 0) {
+          console.warn(`🗑️ 清理损坏(0字节)的本地缓存: ${name}`);
+        }
+
 
         // 2. 本地未命中，从服务器下载
         try {

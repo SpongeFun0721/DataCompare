@@ -233,7 +233,9 @@ export async function exportText() {
  * @returns {string} URL
  */
 export function getPdfUrl(filename) {
-  return `${BASE}/pdf/${encodeURIComponent(filename)}`;
+  const userId = getUserId();
+  const base = `${BASE}/pdf/${encodeURIComponent(filename)}`;
+  return userId ? `${base}?user_id=${encodeURIComponent(userId)}` : base;
 }
 
 /**
