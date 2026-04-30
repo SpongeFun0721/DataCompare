@@ -20,3 +20,5 @@ frontend/dist/
 uv
 DataCompare/
 build_release.py
+.claude
+.vscode

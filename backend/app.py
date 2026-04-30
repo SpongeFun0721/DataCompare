@@ -55,19 +55,25 @@ def _get_user_id(request: Request, query_user_id: str | None = None) -> str:
     """
     从请求中获取用户 ID，优先级：
     1. 请求头 X-User-Id
-    2. 查询参数 user_id
-    3. 自动生成 uuid4 前 8 位
+    2. 参数传入的 query_user_id
+    3. 请求 URL 中的 user_id 参数
+    4. 自动生成 uuid4 前 8 位
     """
     # 1. 优先从请求头获取
     header_user_id = request.headers.get("X-User-Id")
     if header_user_id:
         return header_user_id.strip()
     
-    # 2. 其次从查询参数获取
+    # 2. 其次从参数传入的查询参数获取
     if query_user_id and query_user_id != "default":
         return query_user_id.strip()
+
+    # 3. 从 Request 的查询参数中获取
+    url_user_id = request.query_params.get("user_id")
+    if url_user_id and url_user_id != "default":
+        return url_user_id.strip()
     
-    # 3. 都没有则自动生成
+    # 4. 都没有则自动生成
     return uuid.uuid4().hex[:8]
 
 
