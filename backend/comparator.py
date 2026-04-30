@@ -241,6 +241,17 @@ class Comparator:
                 core_name = match.group(1).strip()
                 page = int(match.group(2))
                 source_type = "yearbook" if "年鉴" in core_name else "report"
+
+                # 对年鉴来源，分离年份标签前缀
+                # "2021年：中国体育年鉴2022+P590" → year_label="2021年", core_name="中国体育年鉴2022"
+                # 避免年份标签（数据所属年份）干扰后续的年鉴 PDF 年份提取
+                year_label = None
+                if source_type == "yearbook":
+                    label_match = re.match(r'(\d{4})\s*(?:年\s*)?[：:]\s*', core_name)
+                    if label_match:
+                        year_label = f"{label_match.group(1)}年"
+                        core_name = core_name[label_match.end():].strip()
+
                 key = (source_type, core_name, page)
                 if key not in seen:
                     seen.add(key)
@@ -248,6 +259,7 @@ class Comparator:
                         source_type=source_type,
                         core_name=core_name,
                         page=page,
+                        year_label=year_label,
                     ))
 
         return results
