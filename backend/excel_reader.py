@@ -473,8 +473,10 @@ def _read_wide_format(df: pd.DataFrame) -> list[Indicator]:
         for col_name, year_str in year_cols:
             raw_val = row.get(col_name)
 
-            # 跳过空值
+            # 跳过空值和空白字符串（仅空格、回车等）
             if pd.isna(raw_val):
+                continue
+            if isinstance(raw_val, str) and not raw_val.strip():
                 continue
 
             # 使用 _parse_special_chars 解析所有格式
