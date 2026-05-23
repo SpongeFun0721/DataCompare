@@ -33,7 +33,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Callable, Coroutine
+from typing import Any, Coroutine
 
 logger = logging.getLogger(__name__)
 

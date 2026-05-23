@@ -426,7 +426,7 @@ class Comparator:
         #   - url: 只处理 URL
         # 三个字段互斥，由 /api/analyze 根据 color_mapping 设置
         # ============================================================
-        print(f"\n>>> DEBUG compare_indicator 来源字段检查:")
+        print("\n>>> DEBUG compare_indicator 来源字段检查:")
         print(f"    source_file_yearbook = {repr(indicator.source_file_yearbook)}")
         print(f"    source_file_report   = {repr(indicator.source_file_report)}")
         print(f"    source_file_url      = {repr(indicator.source_file_url)}")
@@ -435,15 +435,15 @@ class Comparator:
         if indicator.source_file_yearbook:
             source_type = "yearbook"
             source_text = indicator.source_file_yearbook
-            print(f"    ✅ 使用 yearbook 来源")
+            print("    ✅ 使用 yearbook 来源")
         elif indicator.source_file_report:
             source_type = "report"
             source_text = indicator.source_file_report
-            print(f"    ✅ 使用 report 来源")
+            print("    ✅ 使用 report 来源")
         elif indicator.source_file_url:
             source_type = "url"
             source_text = indicator.source_file_url
-            print(f"    ✅ 使用 url 来源")
+            print("    ✅ 使用 url 来源")
         else:
             # 无来源 → 未核对（无法自动判断，留待用户核对）
             print(f"    ⚠️ [{indicator.name}] 无任何来源字段，标记为未核对")
@@ -485,7 +485,7 @@ class Comparator:
                 print(f"    ⚠️ 未在来源文本中找到匹配的多来源项，使用主值 {effective_target}")
 
         if not source_pages:
-            print(f"    ⚠️ 来源文本为空或无法解析，标记为未核对")
+            print("    ⚠️ 来源文本为空或无法解析，标记为未核对")
             indicator.review_status = "未核对"
             return result
 
@@ -509,7 +509,6 @@ class Comparator:
             return result
 
         # 标记是否有 PDF 来源被成功处理
-        has_pdf_processed = False
 
         for sp in filtered_pages:
             if sp.source_type == "url":
@@ -591,7 +590,6 @@ class Comparator:
             indicator.matched_source_type = sp.source_type
             indicator.matched_pdf_name = matched_name
             indicator.matched_page = matched_page or sp.page
-            has_pdf_processed = True
 
             # 取置信度最高的作为 best match
             if all_matches:
@@ -617,7 +615,7 @@ class Comparator:
             if has_mixed_sources:
                 print(f"    [自动确认] ⚠️ 存在多来源类型 ({source_types_in_use})，跳过自动确认")
             elif indicator.multi_source_values:
-                print(f"    [自动确认] ⚠️ 存在多来源数值，跳过自动确认")
+                print("    [自动确认] ⚠️ 存在多来源数值，跳过自动确认")
             elif len(exact_matches) != 1:
                 print(f"    [自动确认] 精确匹配数={len(exact_matches)}，不是恰好1个，跳过自动确认")
             elif exact_matches[0].confidence < 70.0:
@@ -913,7 +911,7 @@ class Comparator:
             diff_converted = abs(pdf_base - excel_base)
             print(f"      [值比对] 换算后比较: pdf_base={pdf_base}, excel_base={excel_base}, diff={diff_converted:.4f}")
             if diff_converted <= self.tolerance:
-                print(f"      [值比对] 换算后匹配成功")
+                print("      [值比对] 换算后匹配成功")
                 return True, pdf_base - excel_base
 
         print(f"      [值比对] ❌ 匹配失败，最终diff=原始{diff_raw:.4f}, 换算后{abs(pdf_base - excel_base):.4f}")
@@ -977,7 +975,7 @@ class Comparator:
             AnalysisResponse 完整的分析结果
         """
         print(f"\n{'='*60}")
-        print(f"开始执行比对分析（预处理的PDF）")
+        print("开始执行比对分析（预处理的PDF）")
         print(f"指标总数: {len(indicators)}, PDF文件数: {len(pdf_names)}")
         print(f"{'='*60}")
 
@@ -1017,7 +1015,7 @@ class Comparator:
             AnalysisResponse 完整的分析结果
         """
         print(f"\n{'='*60}")
-        print(f"开始执行完整比对分析")
+        print("开始执行完整比对分析")
         print(f"PDF目录: {pdf_dir}")
         print(f"{'='*60}")
 
@@ -1026,7 +1024,7 @@ class Comparator:
         print(f"\n{'='*60}")
         print(f"PDF预处理完成，共 {len(pdf_names)} 个文件")
         print(f"指标总数: {len(indicators)}")
-        print(f"开始逐指标比对...")
+        print("开始逐指标比对...")
         print(f"{'='*60}")
 
         results: list[IndicatorResult] = []

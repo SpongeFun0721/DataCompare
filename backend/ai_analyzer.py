@@ -307,7 +307,7 @@ class AIAnalyzer:
         explanation = result.get("explanation", "")
 
         lines = []
-        lines.append(f"📊 AI 分析结果")
+        lines.append("📊 AI 分析结果")
         lines.append(f"{'=' * 40}")
         lines.append(f"数据存在: {'✅ 是' if exists else '❌ 否'}")
         lines.append(f"置信度: {confidence}")

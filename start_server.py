@@ -84,7 +84,7 @@ def _try_start_redis() -> bool:
     try:
         logger.info(f"🚀 正在启动 Redis 服务: {redis_exe}...")
         # 使用 subprocess.Popen 后台启动
-        process = subprocess.Popen(
+        subprocess.Popen(
             [str(redis_exe)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

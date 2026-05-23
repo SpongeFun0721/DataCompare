@@ -16,13 +16,11 @@ import json
 import logging
 import os
 import re
-import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import fitz
-import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -31,16 +29,16 @@ from urllib.parse import quote
 
 from backend.config import UPLOAD_DIR, OUTPUT_DIR, DATA_DIR, BASE_DIR
 from backend.models import (
-    AnalysisResponse, StatusUpdate, IndicatorResult, ProgressInfo, AnalyzeRequest, ManualBinding,
+    AnalysisResponse, StatusUpdate, ProgressInfo, AnalyzeRequest, ManualBinding,
 )
 from backend.excel_reader import read_indicators
 from backend.comparator import Comparator
-from backend.report_generator import generate_report, generate_colored_original_excel
+from backend.report_generator import generate_report
 from backend.ai_analyzer import AIAnalyzer
 from backend.request_controller import (
     UserTaskManager, CachedWebTextExtractor, RateLimitConfig, DomainRateLimiter,
 )
-from backend.scheduler import RequestScheduler, Priority
+from backend.scheduler import RequestScheduler
 from cache.redis_cache import RedisCache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -403,7 +401,6 @@ async def upload_files(
     #    使用 Comparator._parse_source_file 解析每个指标的 source_file，
     #    收集所有引用的 PDF 核心文件名，在 shared_pdfs 中查找匹配的实际文件。
     # ============================================================
-    from backend.comparator import Comparator
 
     matched_pdfs: set[str] = set()
     url_count = 0
@@ -568,7 +565,7 @@ async def run_analysis(
     # ============================================================
     if filtered_indicators:
         first = filtered_indicators[0]
-        print(f"\n=== DEBUG /api/analyze ===")
+        print("\n=== DEBUG /api/analyze ===")
         print(f"  第一个指标: id={first.id}, name='{first.name}', year='{first.year}'")
         print(f"  source_type: report={first.source_file_report}, yearbook={first.source_file_yearbook}, url={first.source_file_url}")
         print(f"  matched_pdfs (from _state): {matched_pdfs}")
@@ -592,7 +589,7 @@ async def run_analysis(
                 for pn in pdf_names:
                     pdf_elem = Comparator._extract_key_elements(pn)
                     print(f"    pdf='{pn}': org='{pdf_elem['org']}', year_pair={pdf_elem['year_pair']}, normalized='{pdf_elem['normalized']}'")
-        print(f"=== DEBUG END ===\n")
+        print("=== DEBUG END ===\n")
 
     async with _semaphore:
         comparator = Comparator()

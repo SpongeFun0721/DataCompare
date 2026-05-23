@@ -39,7 +39,7 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -1184,7 +1184,7 @@ class UserTaskManager:
             try:
                 idx, resp, error = await task
                 results_map[idx] = (resp, error)
-            except Exception as e:
+            except Exception:
                 # 任务本身可能已经失败
                 pass
 

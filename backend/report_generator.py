@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -18,7 +17,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from backend.models import IndicatorResult, Indicator
+from backend.models import IndicatorResult
 from backend.config import OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 # 尝试导入 win32com
 try:
     import win32com.client
-    from win32com.client import constants
+    from win32com.client import constants # noqa: F401
     HAS_WIN32COM = True
 except ImportError:
     HAS_WIN32COM = False
@@ -448,9 +447,9 @@ def _create_summary_sheet(wb: Workbook, results: list[IndicatorResult], pdf_name
 
         # 匹配值
         if best_match and best_match.matched_value is not None:
-            match_cell = ws.cell(row=row_idx, column=9, value=best_match.matched_value)
+            ws.cell(row=row_idx, column=9, value=best_match.matched_value)
         else:
-            match_cell = ws.cell(row=row_idx, column=9, value="未找到")
+            ws.cell(row=row_idx, column=9, value="未找到")
 
         # 是否一致
         if best_match:
@@ -475,7 +474,7 @@ def _create_summary_sheet(wb: Workbook, results: list[IndicatorResult], pdf_name
         ws.cell(row=row_idx, column=13, value=ind.source_file or "")
 
         # 批注
-        note_cell = ws.cell(row=row_idx, column=14, value=ind.note or "")
+        ws.cell(row=row_idx, column=14, value=ind.note or "")
         if ind.note and ind.note.strip():
             # 在指标名称单元格也添加 Excel 批注（作为悬停提示）
             name_cell = ws.cell(row=row_idx, column=5)
